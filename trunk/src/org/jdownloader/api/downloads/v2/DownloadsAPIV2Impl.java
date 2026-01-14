@@ -49,6 +49,7 @@ public class DownloadsAPIV2Impl implements DownloadsAPIV2 {
     private final PackageControllerUtils<FilePackage, DownloadLink> packageControllerUtils;
     private final IDownloadController                               downloadController;
 
+    @SuppressWarnings("unchecked")
     public DownloadsAPIV2Impl(IDownloadController downloadController) {
         this.downloadController = downloadController;
         RemoteAPIController.validateInterfaces(DownloadsAPIV2.class, DownloadsListInterface.class);
