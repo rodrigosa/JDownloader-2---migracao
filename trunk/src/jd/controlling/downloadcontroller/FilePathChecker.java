@@ -1,0 +1,280 @@
+package jd.controlling.downloadcontroller;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.appwork.utils.DebugMode;
+import org.appwork.utils.IO;
+import org.appwork.utils.os.CrossSystem;
+import org.appwork.utils.os.CrossSystem.OperatingSystem;
+import org.jdownloader.controlling.UniqueAlltimeID;
+
+import jd.controlling.downloadcontroller.tests.FilePathCheckerTest;
+
+public class FilePathChecker {
+    /**
+     * The idea is that you can provide a list of flags to the folder create function so it knows to which extend it is allowed to perform
+     * actions such as write-checks.
+     */
+    public static enum CheckFlag {
+        CHECK_FOLDER_CREATE,
+        CHECK_FILE_WRITE,
+        CHECK_FILE_FOR_TOO_LONG_FILENAME,
+        IS_FILE,
+        ERROR_ON_ALREADY_EXIST
+    }
+
+    public static void createFilePath(final File file) throws IOException {
+        createFilePath(file, new CheckFlag[] { CheckFlag.IS_FILE, CheckFlag.CHECK_FILE_WRITE, CheckFlag.CHECK_FILE_FOR_TOO_LONG_FILENAME });
+    }
+
+    public static void createFolderPath(final File file) throws IOException {
+        createFilePath(file, new CheckFlag[] { CheckFlag.CHECK_FOLDER_CREATE });
+    }
+
+    /**
+     * Creates path of given File instance and performs write-test if wanted.
+     *
+     * @throws InterruptedException
+     */
+    public static void createFilePath(final File file, final CheckFlag... flags) throws IOException {
+        boolean isFile = false;
+        boolean checkFileWrite = false;
+        boolean checkFolderCreate = false;
+        boolean allowCheckForTooLongFilename = false;
+        boolean errorOnFileAlreadyExist = false;
+        if (flags != null) {
+            for (final CheckFlag flag : flags) {
+                if (flag == CheckFlag.IS_FILE) {
+                    isFile = true;
+                } else if (flag == CheckFlag.CHECK_FILE_WRITE) {
+                    checkFileWrite = true;
+                } else if (flag == CheckFlag.CHECK_FOLDER_CREATE) {
+                    checkFolderCreate = true;
+                } else if (flag == CheckFlag.CHECK_FILE_FOR_TOO_LONG_FILENAME) {
+                    allowCheckForTooLongFilename = true;
+                } else if (flag == CheckFlag.ERROR_ON_ALREADY_EXIST) {
+                    errorOnFileAlreadyExist = true;
+                }
+            }
+        }
+        if (file == null) {
+            throw new IllegalArgumentException("fileOutput can't be null");
+        } else if (isFile && file.isDirectory()) {
+            throw new BadFilePathException(file, BadFilePathException.PathFailureReason.FILE_ALREADY_EXISTS_AS_FOLDER);
+        } else if (file.exists()) {
+            /* Already exists -> No need to do anything. */
+            if (file.isFile() && errorOnFileAlreadyExist) {
+                throw new BadFilePathException(file, BadFilePathException.PathFailureReason.FILE_ALREADY_EXISTS);
+            }
+            return;
+        }
+        if (file.getParentFile() == null) {
+            // OS root
+            /* This should never happen! */
+            // TODO: Maybe move this up to "fileOutput.isDirectory()" statement.
+            // controller.getLogger().severe("has no parentFile?! " + fileOutput);
+            throw new BadFilePathException(file, BadFilePathException.PathFailureReason.INVALID_DESTINATION);
+        }
+        /* Validate path without writing anything */
+        pathValidation: {
+            File checking = null;
+            String[] folders;
+            switch (CrossSystem.getOSFamily()) {
+            case LINUX:
+                folders = CrossSystem.getPathComponents(file);
+                if (folders.length >= 3) {
+                    final String userName = System.getProperty("user.name");
+                    if (folders.length >= 4 && "run".equals(folders[1]) && "media".equals(folders[2]) && folders[3].equals(userName)) {
+                        /* 0:/ | 1:run | 2:media | 3:user | 4:mounted volume */
+                        checking = new File("/run/media/" + userName + "/" + folders[4]);
+                    } else if ("media".equals(folders[1])) {
+                        /* 0:/ | 1:media | 2:mounted volume */
+                        checking = new File("/media/" + folders[2]);
+                    } else if ("mnt".equals(folders[1])) {
+                        /* 0:/ | 1:media | 2:mounted volume */
+                        checking = new File("/mnt/" + folders[2]);
+                    }
+                }
+                break;
+            case MAC:
+                folders = CrossSystem.getPathComponents(file);
+                if (folders.length >= 3) {
+                    if ("media".equals(folders[1])) {
+                        /* 0:/ | 1:media | 2:mounted volume */
+                        checking = new File("/media/" + folders[2]);
+                    } else if ("mnt".equals(folders[1])) {
+                        /* 0:/ | 1:media | 2:mounted volume */
+                        checking = new File("/mnt/" + folders[2]);
+                    } else if ("Volumes".equals(folders[1])) {
+                        /* 0:/ | 1:Volumes | 2:mounted volume */
+                        checking = new File("/Volumes/" + folders[2]);
+                    }
+                }
+                break;
+            case WINDOWS:
+                if (DebugMode.TRUE_IN_IDE_ELSE_FALSE) {
+                    // TODO: Correctly implement this once we are aware of the current path limitation
+                    final boolean pathLimitActive = true;
+                    final String pathToCheck;
+                    if (isFile) {
+                        pathToCheck = file.getParentFile().getAbsolutePath();
+                    } else {
+                        pathToCheck = file.getAbsolutePath();
+                    }
+                    if (pathLimitActive && pathToCheck.length() >= 259) {
+                        throw new BadFilePathException(file, BadFilePathException.PathFailureReason.PATH_TOO_LONG);
+                    }
+                }
+            default:
+                if (CrossSystem.getOS().isMaximum(OperatingSystem.WINDOWS_NT) && file.getAbsolutePath().length() > 259) {
+                    // old windows API does not allow longer paths
+                    throw new BadFilePathException(file, BadFilePathException.PathFailureReason.PATH_TOO_LONG);
+                }
+                folders = CrossSystem.getPathComponents(file);
+                if (folders.length > 0) {
+                    String root = folders[0];
+                    if (root.matches("^[a-zA-Z]{1}:\\\\$") || root.matches("^[a-zA-Z]{1}://$")) {
+                        /* X:/ or X:\ */
+                        checking = new File(folders[0]);
+                    } else if (root.equals("\\\\")) {
+                        if (folders.length >= 3) {
+                            /* \\\\computer\\folder\\ in network */
+                            checking = new File(folders[0] + folders[1] + "\\" + folders[2]);
+                        }
+                    }
+                }
+            }
+            // TODO: Make this nicer
+            if (checking == null) {
+                break pathValidation;
+            } else if (checking.exists() && checking.isDirectory()) {
+                break pathValidation;
+            } else {
+                /* Invalid path according to path validation */
+                throw new BadFilePathException(file, BadFilePathException.PathFailureReason.INVALID_DESTINATION);
+            }
+        }
+        if (!checkFolderCreate && !checkFileWrite) {
+            /* No errors until now and we're not allowed to write -> Validation successful -> Call it success */
+            return;
+        }
+        /**
+         * Create a list of the full folder path structure.
+         */
+        final List<File> pathlist = new ArrayList<File>();
+        int loop = 0;
+        File next = file;
+        int folderCreateStartSegmentIndex = -1;
+        while (true) {
+            pathlist.add(0, next);
+            if (folderCreateStartSegmentIndex != -1 || (folderCreateStartSegmentIndex == -1 && !next.exists())) {
+                /* Find first non-existent part of path. */
+                folderCreateStartSegmentIndex = loop;
+            }
+            next = next.getParentFile();
+            if (next == null) {
+                /* We've reached the end. */
+                break;
+            }
+            loop++;
+        }
+        if (folderCreateStartSegmentIndex != -1) {
+            /**
+             * Manually create all folders up until we are in our final folder where we want to write the file we want to download. </br>
+             * This may look more complicated compared to File.mkdirs() but this way we can know exactly at which point a directory could
+             * not be created.
+             */
+            folderCreateStartSegmentIndex = pathlist.size() - folderCreateStartSegmentIndex - 1;
+            for (int index = folderCreateStartSegmentIndex; index < pathlist.size(); index++) {
+                final boolean isLastItem = index == pathlist.size() - 1;
+                if (isFile && isLastItem) {
+                    /* Last path segment is file -> Do not create folder! */
+                    break;
+                }
+                final File thisfolder = pathlist.get(index);
+                if (!thisfolder.exists() && !thisfolder.mkdir() && !thisfolder.isDirectory()) {
+                    /* Folder creation failed -> Check/assume why */
+                    if (CrossSystem.isWindows() && looksLikeTooLongWindowsPathOrFilename(thisfolder)) {
+                        /*
+                         * Assume that path is too long. We could check it by writing a shorter folder but it would not change the end
+                         * result: The path is not usable for us.
+                         */
+                        // controller.getLogger().severe("Looks like too long downloadpath for Windows: " + thisfolder.getAbsolutePath());
+                        if (isFile) {
+                            throw new BadFilePathException(thisfolder, BadFilePathException.PathFailureReason.PATH_SEGMENT_TOO_LONG, index);
+                        } else {
+                            throw new BadFilePathException(thisfolder, BadFilePathException.PathFailureReason.PATH_TOO_LONG, index);
+                        }
+                    } else {
+                        throw new BadFilePathException(thisfolder, BadFilePathException.PathFailureReason.PERMISSION_PROBLEM, index);
+                    }
+                }
+            }
+        }
+        /* Check file writability if needed. */
+        if (isFile && checkFileWrite) {
+            /* TODO: Use specific write check functionality here */
+            final File writeTest1 = file;
+            try {
+                fileWriteCheck(writeTest1);
+            } catch (final IOException e1) {
+                /* Check for a too long filename */
+                if (!allowCheckForTooLongFilename) {
+                    /* Filename looks to be too long but we don't check. */
+                    // throw e1;
+                    /* We're not checking for too long filename -> Assume it is a permission problem */
+                    throw new BadFilePathException(file, BadFilePathException.PathFailureReason.PERMISSION_PROBLEM, pathlist.size() - 1);
+                }
+                final File writeTest2 = new File(writeTest1.getParent(), "jd_accessCheck_" + new UniqueAlltimeID().getID());
+                if (writeTest2.exists()) {
+                    /* This shall never happen */
+                    throw e1;
+                }
+                try {
+                    fileWriteCheck(writeTest2);
+                } catch (final IOException e2) {
+                    /* Permission issue because we were unable to write any file in this directory. */
+                    throw new BadFilePathException(file, BadFilePathException.PathFailureReason.PERMISSION_PROBLEM, pathlist.size() - 1);
+                }
+                /*
+                 * We assume that the given filename is too long because writing a file with a shorter filename was successful.
+                 */
+                throw new BadFilePathException(file, BadFilePathException.PathFailureReason.PATH_SEGMENT_TOO_LONG, pathlist.size() - 1);
+            }
+        }
+    }
+
+    /** Writes file and deletes it again. */
+    public static void fileWriteCheck(final File file) throws IOException {
+        final RandomAccessFile raffile = IO.open(file, "rw");
+        raffile.close();
+        if (!file.delete()) {
+            /* This should never happen! */
+            // logger.warning("Failed to delete test-written file with shortened filename");
+            throw new IOException("Failed to delete written file");
+        }
+    }
+
+    public static boolean looksLikeTooLongWindowsPathOrFilename(final File file) throws IOException {
+        // TODO: Add exceptions for "non limited" paths starting with "\\?\'drive-letter'\"
+        final String[] folders = CrossSystem.getPathComponents(file);
+        for (final String folder : folders) {
+            if (looksLikeTooLongWindowsPathSegment(folder)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static boolean looksLikeTooLongWindowsPathSegment(final String str) throws IOException {
+        return str.length() > 255;
+    }
+
+    public static void main(String[] args) throws IOException {
+        FilePathCheckerTest.main(args);
+    }
+}

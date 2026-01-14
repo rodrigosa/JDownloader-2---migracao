@@ -1,0 +1,71 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+allprojects {
+    apply plugin: 'java'
+    
+    java {
+        toolchain { languageVersion = JavaLanguageVersion.of(17) }
+    }
+
+    repositories {
+        mavenCentral()
+        mavenCentral()
+        flatDir { dirs "${rootProject.projectDir}/trunk/ressourcen/libs", "${rootProject.projectDir}/trunk/ressourcen/libs_ext" }
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+        options.compilerArgs << "--add-exports=java.base/sun.net.www.protocol.jar=ALL-UNNAMED"
+        options.compilerArgs << "--add-exports=java.base/sun.net.www=ALL-UNNAMED"
+        options.compilerArgs << "-nowarn"
+        options.compilerArgs << "-Xlint:none"
+    }
+}
+
+// Configuração específica do módulo principal (trunk)
+project(':trunk') {
+    apply plugin: 'application'
+    
+    application {
+        mainClass = 'org.jdownloader.startup.Main'
+        // Estes argumentos são cruciais no Java 17 para evitar erros de permissão
+        applicationDefaultJvmArgs = [
+            "--add-opens=java.desktop/javax.swing=ALL-UNNAMED",
+            "--add-opens=java.desktop/java.awt=ALL-UNNAMED",
+            "--add-opens=java.base/java.lang=ALL-UNNAMED",
+            "--add-opens=java.base/java.net=ALL-UNNAMED",
+            "--add-exports=java.base/sun.net.www.protocol.jar=ALL-UNNAMED",
+            "-Xmx1024m"
+        ]
+    }
+
+    sourceSets {
+        main {
+            java { srcDirs = ['src'] }
+            resources { 
+                srcDirs = ['src', 'translations', 'themes', 'ressourcen']
+                exclude '**/*.java'
+            }
+        }
+    }
+
+    dependencies {
+        implementation project(':AppWorkUtils')
+        implementation project(':browser')
+        implementation project(':MyJDownloaderClient')
+        implementation fileTree(dir: 'libs', include: ['*.jar'])
+    }
+}
+
+// Configuração dos módulos de suporte
+configure([project(':AppWorkUtils'), project(':browser'), project(':MyJDownloaderClient')]) {
+    sourceSets {
+        main {
+            java { srcDirs = ['src'] }
+            resources { srcDirs = ['src'] }
+        }
+    }
+}

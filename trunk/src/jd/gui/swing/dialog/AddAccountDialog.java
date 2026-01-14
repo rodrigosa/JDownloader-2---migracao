@@ -1,0 +1,530 @@
+//    jDownloader - Downloadmanager
+//    Copyright (C) 2009  JD-Team support@jdownloader.org
+//
+//    This program is free software: you can redistribute it and/or modify
+//    it under the terms of the GNU General Public License as published by
+//    the Free Software Foundation, either version 3 of the License, or
+//    (at your option) any later version.
+//
+//    This program is distributed in the hope that it will be useful,
+//    but WITHOUT ANY WARRANTY; without even the implied warranty of
+//    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//    GNU General Public License for more details.
+//
+//    You should have received a copy of the GNU General Public License
+//    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+package jd.gui.swing.dialog;
+
+import java.awt.AWTEvent;
+import java.awt.AlphaComposite;
+import java.awt.Component;
+import java.awt.Composite;
+import java.awt.Dimension;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.awt.event.FocusEvent;
+import java.awt.event.FocusListener;
+import java.awt.event.KeyEvent;
+import java.awt.event.KeyListener;
+import java.awt.event.MouseAdapter;
+import java.awt.event.WindowEvent;
+import java.awt.event.WindowFocusListener;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+
+import javax.swing.BorderFactory;
+import javax.swing.JButton;
+import javax.swing.JComponent;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.JScrollPane;
+import javax.swing.KeyStroke;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
+
+import org.appwork.scheduler.DelayedRunnable;
+import org.appwork.swing.components.ExtTextField;
+import org.appwork.utils.StringUtils;
+import org.appwork.utils.swing.EDTRunner;
+import org.appwork.utils.swing.ListFocusTraversalPolicy;
+import org.appwork.utils.swing.SwingUtils;
+import org.appwork.utils.swing.dialog.AbstractDialog;
+import org.appwork.utils.swing.dialog.Dialog;
+import org.appwork.utils.swing.dialog.DialogCanceledException;
+import org.appwork.utils.swing.dialog.DialogNoAnswerException;
+import org.appwork.utils.swing.dialog.ProgressDialog;
+import org.appwork.utils.swing.dialog.ProgressDialog.ProgressGetter;
+import org.appwork.utils.swing.dialog.dimensor.RememberLastDialogDimension;
+import org.appwork.utils.swing.dialog.locator.RememberRelativeDialogLocator;
+import org.jdownloader.gui.IconKey;
+import org.jdownloader.gui.InputChangedCallbackInterface;
+import org.jdownloader.gui.sponsor.SponsorUtils;
+import org.jdownloader.gui.translate._GUI;
+import org.jdownloader.images.AbstractIcon;
+import org.jdownloader.plugins.accounts.AccountBuilderInterface;
+import org.jdownloader.plugins.controller.PluginClassLoader;
+import org.jdownloader.plugins.controller.PluginClassLoader.PluginClassLoaderChild;
+import org.jdownloader.plugins.controller.UpdateRequiredClassNotFoundException;
+import org.jdownloader.plugins.controller.host.HostPluginController;
+import org.jdownloader.plugins.controller.host.LazyHostPlugin;
+import org.jdownloader.plugins.controller.host.PluginFinder;
+import org.jdownloader.translate._JDT;
+
+import jd.controlling.AccountController;
+import jd.controlling.accountchecker.AccountChecker;
+import jd.controlling.accountchecker.AccountChecker.AccountCheckJob;
+import jd.gui.UserIO;
+import jd.gui.swing.jdgui.JDGui;
+import jd.gui.swing.jdgui.views.settings.panels.accountmanager.RefreshAction;
+import jd.plugins.Account;
+import jd.plugins.Account.AccountError;
+import jd.plugins.AccountInfo;
+import jd.plugins.PluginForHost;
+import net.miginfocom.swing.MigLayout;
+
+public class AddAccountDialog extends AbstractDialog<Integer> implements InputChangedCallbackInterface {
+    public static void showDialog(PluginForHost preSelectedPlugin, Account preFillAccount) {
+        try {
+            while (true) {
+                final AddAccountDialog dialog = new AddAccountDialog(preSelectedPlugin, preFillAccount);
+                Dialog.getInstance().showDialog(dialog);
+                if (dialog.getHoster() == null) {
+                    return;
+                }
+                final Account accountToAdd = dialog.getAccount();
+                accountToAdd.setHoster(dialog.getHoster().getDisplayName());
+                if (addAccount(accountToAdd)) {
+                    return;
+                }
+                preSelectedPlugin = dialog.getHoster().getPrototype(null);
+                preFillAccount = accountToAdd;
+            }
+        } catch (DialogNoAnswerException ignore) {
+        } catch (Throwable e) {
+            org.appwork.utils.logging2.extmanager.LoggerFactory.getDefaultLogger().log(e);
+        }
+    }
+
+    public static boolean addAccount(final Account ac) throws DialogNoAnswerException {
+        try {
+            checkAccount(ac);
+        } catch (final DialogNoAnswerException e) {
+            throw e;
+        } catch (final Throwable e) {
+            Dialog.getInstance().showExceptionDialog(_GUI.T.accountdialog_check_failed(), _GUI.T.accountdialog_check_failed_msg(), e);
+        }
+        AccountError error = ac.getError();
+        String errorMessage = ac.getErrorString();
+        if (StringUtils.isEmpty(errorMessage)) {
+            AccountInfo ai = ac.getAccountInfo();
+            if (ai != null) {
+                errorMessage = ai.getStatus();
+            }
+        }
+        if (error != null) {
+            switch (error) {
+            case PLUGIN_ERROR:
+                if (StringUtils.isEmpty(errorMessage)) {
+                    errorMessage = _JDT.T.AccountController_updateAccountInfo_status_plugin_defect();
+                }
+                Dialog.getInstance().showMessageDialog(_GUI.T.accountdialog_check_invalid(errorMessage));
+                return false;
+            case EXPIRED:
+                Dialog.getInstance().showConfirmDialog(0, _GUI.T.accountdialog_check_expired_title(), _GUI.T.accountdialog_check_expired(ac.getUser()), null, _GUI.T.accountdialog_check_expired_renew(), null);
+                AccountController.getInstance().addAccount(ac, false);
+                return true;
+            case TEMP_DISABLED:
+                if (StringUtils.isEmpty(errorMessage)) {
+                    errorMessage = _GUI.T.accountdialog_check_failed();
+                }
+                Dialog.getInstance().showMessageDialog(_GUI.T.accountdialog_check_result(errorMessage));
+                AccountController.getInstance().addAccount(ac, false);
+                return true;
+            default:
+            case INVALID:
+                if (StringUtils.isEmpty(errorMessage)) {
+                    errorMessage = _GUI.T.accountdialog_check_failed_msg();
+                }
+                Dialog.getInstance().showMessageDialog(_GUI.T.accountdialog_check_invalid(errorMessage));
+                return false;
+            }
+        }
+        /* Success */
+        String message = null;
+        final AccountInfo ai = ac.getAccountInfo();
+        if (ai != null) {
+            message = ai.getStatus();
+        }
+        if (StringUtils.isEmpty(message)) {
+            message = _GUI.T.lit_yes();
+        }
+        Dialog.getInstance().showMessageDialog(_GUI.T.accountdialog_check_valid(message));
+        AccountController.getInstance().addAccount(ac, false);
+        if (ac.isMultiHost()) {
+            RefreshAction.displayMultihosterDetailOverviewHelpDialog();
+        }
+        return true;
+    }
+
+    public static ProgressDialog checkAccount(final Account ac) throws Throwable {
+        ProgressDialog pd = new ProgressDialog(new ProgressGetter() {
+            public void run() throws Exception {
+                final PluginForHost hostPlugin = new PluginFinder().assignPlugin(ac, true);
+                if (hostPlugin != null) {
+                    ac.setPlugin(hostPlugin);
+                }
+                AccountCheckJob job = AccountChecker.getInstance().check(ac, true);
+                job.waitChecked();
+            }
+
+            public String getString() {
+                return null;
+            }
+
+            public int getProgress() {
+                return -1;
+            }
+
+            @Override
+            public String getLabelString() {
+                return null;
+            }
+        }, 0, _GUI.T.accountdialog_check(), _GUI.T.accountdialog_check_msg(), ac.getDomainInfo().getFavIcon());
+        try {
+            Dialog.getInstance().showDialog(pd);
+        } catch (DialogCanceledException e) {
+            if (pd.getThrowable() == null) {
+                throw e;
+            } else {
+                throw pd.getThrowable();
+            }
+        }
+        return pd;
+    }
+
+    private HosterChooserTable           hosterTable;
+    private JPanel                       content;
+    private final PluginClassLoaderChild cl;
+    protected MouseAdapter               mouseAdapter;
+    private ExtTextField                 filter;
+    private JLabel                       header2;
+    private JButton                      link;
+
+    private AddAccountDialog(final PluginForHost preSelectedPlugin, final Account preFillAccount) {
+        super(UserIO.NO_ICON, _GUI.T.jd_gui_swing_components_AccountDialog_title(), null, _GUI.T.lit_save(), null);
+        this.preFillAccount = preFillAccount;
+        this.preSelectedPlugin = preSelectedPlugin;
+        cl = PluginClassLoader.getInstance().getChild();
+        setLocator(new RememberRelativeDialogLocator("AddAccountDialog2", JDGui.getInstance().getMainFrame()));
+        setDimensor(new RememberLastDialogDimension("AddAccountDialog2"));
+    }
+
+    @Override
+    protected Integer createReturnValue() {
+        return this.getReturnmask();
+    }
+
+    protected void initFocus(final JComponent focus) {
+    }
+
+    private List<Component> inputComponents;
+
+    @Override
+    public JComponent layoutDialogContent() {
+        final Collection<LazyHostPlugin> allPLugins = HostPluginController.getInstance().list();
+        // Filter - only premium plugins should be here
+        final java.util.List<LazyHostPlugin> plugins = new ArrayList<LazyHostPlugin>();
+        for (LazyHostPlugin lhp : allPLugins) {
+            if (lhp.isPremium()) {
+                plugins.add(lhp);
+            }
+        }
+        if (plugins.size() == 0) {
+            throw new RuntimeException("No Plugins Loaded Exception");
+        }
+        filter = new ExtTextField() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2 = (Graphics2D) g;
+                Composite comp = g2.getComposite();
+                g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.6f));
+                new AbstractIcon(IconKey.ICON_SEARCH, 16).paintIcon(this, g2, 3, 3);
+                g2.setComposite(comp);
+            }
+        };
+        filter.addFocusListener(new FocusListener() {
+            @Override
+            public void focusLost(FocusEvent e) {
+            }
+
+            @Override
+            public void focusGained(FocusEvent e) {
+                filter.selectAll();
+            }
+        });
+        filter.setHelpText("Search Plugins");
+        filter.addKeyListener(new KeyListener() {
+            @Override
+            public void keyTyped(KeyEvent e) {
+            }
+
+            @Override
+            public void keyReleased(KeyEvent e) {
+            }
+
+            @Override
+            public void keyPressed(KeyEvent e) {
+                if (e.getKeyCode() == KeyEvent.VK_DOWN) {
+                    hosterTable.onKeyDown();
+                }
+                if (e.getKeyCode() == KeyEvent.VK_UP) {
+                    hosterTable.onKeyUp();
+                }
+            }
+        });
+        filter.setBorder(BorderFactory.createCompoundBorder(filter.getBorder(), BorderFactory.createEmptyBorder(0, 20, 0, 0)));
+        hosterTable = new HosterChooserTable(plugins) {
+            @Override
+            protected void processEvent(AWTEvent e) {
+                if (e instanceof KeyEvent) {
+                    if (((KeyEvent) e).getKeyCode() == KeyEvent.VK_TAB) {
+                        content.dispatchEvent(e);
+                        return;
+                    }
+                }
+                super.processEvent(e);
+            }
+
+            @Override
+            protected boolean processKeyBinding(KeyStroke stroke, KeyEvent evt, int condition, boolean pressed) {
+                return super.processKeyBinding(stroke, evt, condition, pressed);
+            }
+
+            private LazyHostPlugin lazyHostPlugin = null;
+
+            public void valueChanged(javax.swing.event.ListSelectionEvent e) {
+                super.valueChanged(e);
+                if (e.getValueIsAdjusting() || getModel().isTableSelectionClearing()) {
+                    return;
+                }
+                try {
+                    scrollToSelection(0);
+                    final LazyHostPlugin selected = getSelectedPlugin();
+                    final PluginForHost plg = selected != null ? selected.newInstance(cl) : null;
+                    if (plg != null && (lazyHostPlugin == null || !lazyHostPlugin.equals(plg.getLazyP()))) {
+                        final PluginForHost ret = updatePanel(plg);
+                        if (ret != null) {
+                            lazyHostPlugin = ret.getLazyP();
+                        }
+                    }
+                } catch (UpdateRequiredClassNotFoundException e1) {
+                    e1.printStackTrace();
+                }
+            }
+        };
+        filter.getDocument().addDocumentListener(new DocumentListener() {
+            private DelayedRunnable delayedRefresh = new DelayedRunnable(200, 1000) {
+                String lastText = null;
+
+                @Override
+                public String getID() {
+                    return "AddAccountDialog";
+                }
+
+                @Override
+                public void delayedrun() {
+                    new EDTRunner() {
+                        @Override
+                        protected void runInEDT() {
+                            final String text = filter.getText();
+                            if (!StringUtils.equals(lastText, text)) {
+                                lastText = text;
+                                hosterTable.refresh(text);
+                            }
+                        }
+                    }.waitForEDT();
+                }
+            };
+
+            @Override
+            public void removeUpdate(DocumentEvent e) {
+                delayedRefresh.resetAndStart();
+            }
+
+            @Override
+            public void insertUpdate(DocumentEvent e) {
+                delayedRefresh.resetAndStart();
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e) {
+                delayedRefresh.resetAndStart();
+            }
+        });
+        link = new JButton(new AbstractIcon(IconKey.ICON_MONEY, 16));
+        link.setText(_GUI.T.gui_menu_action_premium_buy_name());
+        link.setToolTipText(_GUI.T.gui_menu_action_premium_buy_name());
+        link.addActionListener(new ActionListener() {
+            public void actionPerformed(final ActionEvent e) {
+                final LazyHostPlugin selected = hosterTable.getSelectedPlugin();
+                AccountController.openAfflink(selected, null, "accountmanager/table");
+            }
+        });
+        link.setFocusable(false);
+        content = new JPanel(new MigLayout("ins 0, wrap 1", "[grow,fill]"));
+        content.add(header(_GUI.T.AddAccountDialog_layoutDialogContent_choosehoster_()), "gapleft 15,spanx,pushx,growx");
+        content.add(filter, "gapleft 32,pushx,growx");
+        JScrollPane sp;
+        content.add(sp = new JScrollPane(hosterTable), "gapleft 32,pushy,growy");
+        sp.setFocusable(false);
+        sp.getVerticalScrollBar().setFocusable(false);
+        sp.getViewport().setFocusable(false);
+        content.add(link, "height 20!,gapleft 32");
+        content.add(header2 = header(_GUI.T.AddAccountDialog_layoutDialogContent_enterlogininfo()), "gapleft 15,spanx,pushx,growx,gaptop 15");
+        final LazyHostPlugin lazyp = getPreselectedHost();
+        if (lazyp != null) {
+            hosterTable.setSelectedPlugin(lazyp);
+        }
+        getDialog().addWindowFocusListener(new WindowFocusListener() {
+            @Override
+            public void windowLostFocus(final WindowEvent windowevent) {
+            }
+
+            @Override
+            public void windowGainedFocus(final WindowEvent windowevent) {
+                final Component focusOwner = getDialog().getFocusOwner();
+                if (focusOwner != null) {
+                    // dialog component has already focus...
+                    return;
+                }
+                /* we only want to force focus on first window open */
+                getDialog().removeWindowFocusListener(this);
+                focusFirstInputComponent();
+            }
+        });
+        getDialog().setMinimumSize(new Dimension(400, 300));
+        return content;
+    }
+
+    private final PluginForHost preSelectedPlugin;
+
+    protected LazyHostPlugin getPreselectedHost() {
+        if (preSelectedPlugin != null) {
+            return preSelectedPlugin.getLazyP();
+        }
+        final HostPluginController hc = HostPluginController.getInstance();
+        final String preSelectedHost = SponsorUtils.getSponsor().getPreSelectedInAddAccountDialog();
+        LazyHostPlugin ret = hc.get(preSelectedHost);
+        if (ret != null) {
+            return ret;
+        }
+        ret = hc.get("rapidgator.net");
+        if (ret != null) {
+            return ret;
+        }
+        ret = hc.list().iterator().next();
+        return ret;
+    }
+
+    protected int getPreferredWidth() {
+        return 600;
+    }
+
+    @Override
+    protected int getPreferredHeight() {
+        return 450;
+    }
+
+    public LazyHostPlugin getHoster() {
+        return this.hosterTable.getSelectedPlugin();
+    }
+
+    private Account                 preFillAccount;
+    private AccountBuilderInterface currentAccountBuilder;
+
+    private Account getAccount() {
+        final AccountBuilderInterface accountBuilder = currentAccountBuilder;
+        if (accountBuilder == null) {
+            return null;
+        }
+        return accountBuilder.getAccount();
+    }
+
+    private PluginForHost updatePanel(PluginForHost selectedPlugin) {
+        try {
+            if (content == null) {
+                return null;
+            }
+            if (selectedPlugin == null) {
+                selectedPlugin = getPreselectedHost().newInstance(cl);
+            }
+            link.setText(_GUI.T.gui_menu_action_premium_buy_name2(selectedPlugin.getHost()));
+            header2.setText(_GUI.T.AddAccountDialog_layoutDialogContent_enterlogininfo2(selectedPlugin.getHost()));
+            if (currentAccountBuilder != null) {
+                preFillAccount = currentAccountBuilder.getAccount();
+                if (preFillAccount != null && StringUtils.firstNotEmpty(preFillAccount.getUser(), preFillAccount.getPass()) == null) {
+                    preFillAccount = null;
+                }
+                content.remove(currentAccountBuilder.getComponent());
+            }
+            final AccountBuilderInterface accountFactory = currentAccountBuilder = selectedPlugin.getAccountFactory(this);
+            final JComponent comp;
+            content.add(comp = accountFactory.getComponent(), "gapleft 32,spanx");
+            if (preFillAccount != null) {
+                accountFactory.setAccount(preFillAccount);
+            } else if (accountFactory.handleClipboardAutoFill()) {
+                accountFactory.validateInputs();
+            }
+            final ArrayList<Component> focusOrder = new ArrayList<Component>();
+            focusOrder.add(filter);
+            focusOrder.addAll(inputComponents = ListFocusTraversalPolicy.getFocusableComponents(comp));
+            focusOrder.add(okButton);
+            focusOrder.add(cancelButton);
+            dialog.setFocusTraversalPolicyProvider(true);
+            dialog.setFocusTraversalPolicy(new ListFocusTraversalPolicy(focusOrder));
+            onChangedInput(null);
+            return selectedPlugin;
+        } catch (UpdateRequiredClassNotFoundException e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    @Override
+    public void actionPerformed(ActionEvent e) {
+        if (e.getSource() == okButton) {
+            if (hosterTable != null && hosterTable.getSelectedPlugin() != null && currentAccountBuilder != null && currentAccountBuilder.validateInputs()) {
+                super.actionPerformed(e);
+            }
+        } else {
+            super.actionPerformed(e);
+        }
+    }
+
+    private JLabel header(String buyAndAddPremiumAccount_layoutDialogContent_get) {
+        final JLabel ret = SwingUtils.toBold(new JLabel(buyAndAddPremiumAccount_layoutDialogContent_get));
+        ret.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, ret.getForeground()));
+        return ret;
+    }
+
+    @Override
+    public void windowGainedFocus(WindowEvent e) {
+        super.windowGainedFocus(e);
+        focusFirstInputComponent();
+    }
+
+    @Override
+    public void onChangedInput(Object component) {
+        InputOKButtonAdapter.register(this, currentAccountBuilder);
+    }
+
+    protected void focusFirstInputComponent() {
+        filter.requestFocus();
+    }
+}

@@ -1,0 +1,850 @@
+//jDownloader - Downloadmanager
+//Copyright (C) 2015  JD-Team support@jdownloader.org
+//
+//This program is free software: you can redistribute it and/or modify
+//it under the terms of the GNU General Public License as published by
+//the Free Software Foundation, either version 3 of the License, or
+//(at your option) any later version.
+//
+//This program is distributed in the hope that it will be useful,
+//but WITHOUT ANY WARRANTY; without even the implied warranty of
+//MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//GNU General Public License for more details.
+//
+//You should have received a copy of the GNU General Public License
+//along with this program.  If not, see <http://www.gnu.org/licenses/>.
+package jd.plugins.decrypter;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+
+import jd.PluginWrapper;
+import jd.controlling.ProgressController;
+import jd.http.Browser;
+import jd.nutils.encoding.Encoding;
+import jd.parser.Regex;
+import jd.parser.html.Form;
+import jd.parser.html.Form.MethodType;
+import jd.parser.html.InputField;
+import jd.plugins.CryptedLink;
+import jd.plugins.DecrypterException;
+import jd.plugins.DecrypterPlugin;
+import jd.plugins.DecrypterRetryException;
+import jd.plugins.DecrypterRetryException.RetryReason;
+import jd.plugins.DownloadLink;
+import jd.plugins.FilePackage;
+import jd.plugins.LinkStatus;
+import jd.plugins.PluginException;
+import jd.plugins.PluginForDecrypt;
+
+import org.appwork.storage.JSonStorage;
+import org.appwork.utils.DebugMode;
+import org.appwork.utils.StringUtils;
+import org.appwork.utils.formatter.HexFormatter;
+import org.appwork.utils.formatter.SizeFormatter;
+import org.appwork.utils.net.URLHelper;
+import org.appwork.utils.parser.UrlQuery;
+import org.jdownloader.captcha.v2.challenge.clickcaptcha.ClickedPoint;
+import org.jdownloader.captcha.v2.challenge.cutcaptcha.CaptchaHelperCrawlerPluginCutCaptcha;
+import org.jdownloader.captcha.v2.challenge.recaptcha.v2.AbstractRecaptchaV2;
+import org.jdownloader.captcha.v2.challenge.recaptcha.v2.CaptchaHelperCrawlerPluginRecaptchaV2;
+import org.jdownloader.plugins.components.config.FileCryptConfig;
+import org.jdownloader.plugins.components.config.FileCryptConfig.CrawlMode;
+import org.jdownloader.plugins.config.PluginJsonConfig;
+
+@DecrypterPlugin(revision = "$Revision: 51985 $", interfaceVersion = 3, names = {}, urls = {})
+public class FileCryptCc extends PluginForDecrypt {
+    public FileCryptCc(PluginWrapper wrapper) {
+        super(wrapper);
+    }
+
+    @Override
+    public int getMaxConcurrentProcessingInstances() {
+        /* Limit to 1 to avoid getting IP-banned by filecrypt or filecrypt forcing user to always enter CutCaptcha captchas. */
+        return 1;
+    }
+
+    public Browser createNewBrowserInstance() {
+        final Browser br = super.createNewBrowserInstance();
+        br.setLoadLimit(br.getLoadLimit() * 2);
+        br.getHeaders().put("Accept-Encoding", "gzip, deflate");
+        br.setFollowRedirects(true);
+        /* Prefer English language */
+        br.setCookie(getHost(), "lang_v2", "en_US");
+        br.addAllowedResponseCodes(500);// submit captcha responds with 500 code
+        br.getHeaders().put("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36");
+        return br;
+    }
+
+    public static List<String[]> getPluginDomains() {
+        final List<String[]> ret = new ArrayList<String[]>();
+        // each entry in List<String[]> will result in one PluginForDecrypt, Plugin.getHost() will return String[0]->main domain
+        ret.add(new String[] { "filecrypt.cc", "filecrypt.co", "filecrypt.to" });
+        return ret;
+    }
+
+    public static String[] getAnnotationNames() {
+        return buildAnnotationNames(getPluginDomains());
+    }
+
+    @Override
+    public String[] siteSupportedNames() {
+        return buildSupportedNames(getPluginDomains());
+    }
+
+    public static String[] getAnnotationUrls() {
+        return buildAnnotationUrls(getPluginDomains());
+    }
+
+    public static String[] buildAnnotationUrls(final List<String[]> pluginDomains) {
+        final List<String> ret = new ArrayList<String>();
+        for (final String[] domains : pluginDomains) {
+            ret.add("https?://(?:www\\.)?" + buildHostsPatternPart(domains) + "/Container/([A-Z0-9]{10,16})(\\.html)?(\\?mirror=\\d+)?");
+        }
+        return ret.toArray(new String[0]);
+    }
+
+    @Override
+    public boolean hasCaptcha(CryptedLink link, jd.plugins.Account acc) {
+        /* Most of all filecrypt links are captcha-protected. */
+        return true;
+    }
+
+    private static final String PROPERTY_PLUGIN_LAST_USED_PASSWORD = "last_used_password";
+    private String              logoPW                             = null;
+    private String              successfullyUsedFolderPassword     = null;
+
+    public ArrayList<DownloadLink> decryptIt(final CryptedLink param, ProgressController progress) throws Exception {
+        final FileCryptConfig cfg = PluginJsonConfig.get(this.getConfigInterface());
+        String contenturl = URLHelper.getUrlWithoutParams(param.getCryptedUrl());
+        if (!StringUtils.endsWithCaseInsensitive(contenturl, ".html")) {
+            /* Fix url in case user added URL without .html ending. */
+            contenturl += ".html";
+        }
+        final String contenturl_without_params = contenturl;
+        final String folderID = new Regex(contenturl, this.getSupportedLinks()).getMatch(0);
+        String mirrorIdFromAddedURL = UrlQuery.parse(param.getCryptedUrl()).get("mirror");
+        if (mirrorIdFromAddedURL != null && !mirrorIdFromAddedURL.matches("\\d+")) {
+            /* This should never happen */
+            logger.info("User added URL with invalid mirror_id value (not a number) -> " + mirrorIdFromAddedURL);
+            mirrorIdFromAddedURL = null;
+        }
+        if (mirrorIdFromAddedURL != null) {
+            contenturl += "?mirror=" + mirrorIdFromAddedURL;
+        }
+        /* Nullification of our beloved global variables */
+        this.logoPW = null;
+        this.successfullyUsedFolderPassword = null;
+        this.handlePasswordAndCaptcha(param, folderID, contenturl);
+        ArrayList<String> extractionPasswordList = null;
+        if (successfullyUsedFolderPassword != null || logoPW != null) {
+            /* Assume that the required password is also the extract password. */
+            extractionPasswordList = new ArrayList<String>();
+            if (successfullyUsedFolderPassword != null) {
+                extractionPasswordList.add(successfullyUsedFolderPassword);
+            }
+            /* Password by custom logo can differ from folder password and can also be given if no folder password is needed. */
+            if (logoPW != null && !logoPW.equals(successfullyUsedFolderPassword)) {
+                extractionPasswordList.add(logoPW);
+            }
+        }
+        if (mirrorIdFromAddedURL != null && looksLikeUploaderHasDeactivatedAllMirrors(br)) {
+            logger.info("Attempting workaround for misleading error message 'user has deactivated all mirrors for this folder' while maybe only the mirror_id inside the added URL is offline");
+            this.getPage(contenturl_without_params);
+            if (looksLikeUploaderHasDeactivatedAllMirrors(br)) {
+                throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+            }
+            logger.info("Workaround successful -> mirror_id from added url does not exist: " + mirrorIdFromAddedURL);
+            /* Nullify so later checks ignore this mirror_id as if it never existed */
+            mirrorIdFromAddedURL = null;
+        }
+        /* Crawl mirrors */
+        FilePackage fp = null;
+        final String fpName = br.getRegex("<h2>([^<]+)<").getMatch(0);
+        if (fpName != null) {
+            fp = FilePackage.getInstance();
+            fp.setName(Encoding.htmlDecode(fpName).trim());
+        }
+        String[] availableMirrorurls = br.getRegex("\"([^\"]*/Container/[A-Z0-9]+\\.html\\?mirror=\\d+)").getColumn(0);
+        if (availableMirrorurls == null || availableMirrorurls.length == 0) {
+            /* Fallback -> Probably 1 mirror available */
+            if (looksLikeUploaderHasDeactivatedAllMirrors(br)) {
+                throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+            }
+            logger.info("Failed to find any mirrors in html -> Looks like only one mirror is available");
+            availableMirrorurls = new String[1];
+            if (mirrorIdFromAddedURL != null) {
+                availableMirrorurls[0] = contenturl;
+            } else {
+                availableMirrorurls[0] = contenturl + "?mirror=0";
+            }
+        }
+        final List<String> mirror_urls = new ArrayList<String>();
+        final List<String> mirror_ids = new ArrayList<String>();
+        String urlWithUserPreferredMirrorID = null;
+        for (final String mirrorurl : availableMirrorurls) {
+            final String mirror_id = UrlQuery.parse(mirrorurl).get("mirror");
+            /* Prevent duplicates */
+            if (mirror_ids.contains(mirror_id)) {
+                continue;
+            }
+            mirror_ids.add(mirror_id);
+            if (StringUtils.equals(mirror_id, mirrorIdFromAddedURL)) {
+                logger.info("Found user preferred mirrorID " + mirrorIdFromAddedURL);
+                urlWithUserPreferredMirrorID = mirrorurl;
+            }
+            mirror_urls.add(mirrorurl);
+        }
+        logger.info("Available mirrors: " + mirror_ids.size() + " | mirror_ids: " + mirror_ids);
+        if (mirrorIdFromAddedURL != null && urlWithUserPreferredMirrorID == null) {
+            logger.info("User preferred mirrorID " + mirrorIdFromAddedURL + " does not exist in list of really existing mirrors");
+        }
+        final ArrayList<DownloadLink> ret = new ArrayList<DownloadLink>();
+        int numberofOfflineMirrors = 0;
+        int numberofSkippedFakeAdvertisementMirrors = 0;
+        mirrorLoop: for (int mirrorindex = 0; mirrorindex < mirror_urls.size(); mirrorindex++) {
+            final String mirrorurl = mirror_urls.get(mirrorindex);
+            final String currentMirrorID = UrlQuery.parse(mirrorurl).get("mirror");
+            logger.info("Crawling mirror " + (mirrorindex + 1) + "/" + mirror_urls.size() + " | MirrorID: " + currentMirrorID + " | " + mirrorurl);
+            if (mirrorindex > 0) {
+                /* Password and captcha can be required for each mirror */
+                this.handlePasswordAndCaptcha(param, folderID, mirrorurl);
+            } else {
+                logger.info("Do not access mirrorurl because we are currently crawling the first mirror");
+            }
+            boolean mirrorLooksToBeOffline = false;
+            boolean mirrorLooksToBeAdvertisement = false;
+            if (br.containsHTML("class=\"window container offline\"")) {
+                logger.info("Mirror looks to be offline: " + mirrorurl);
+                numberofOfflineMirrors++;
+                mirrorLooksToBeOffline = true;
+            } else if (br.getURL().contains("mirror=666") && br.containsHTML("usenet")) {
+                logger.info("Mirror looks to be a fake advertisement mirror: " + mirrorurl);
+                mirrorLooksToBeAdvertisement = true;
+            }
+            /* Try CNL/clicknload first as it doesn't rely on JD service.jdownloader.org, which can go down! */
+            final boolean testDevCnlFailure = false;
+            final boolean testDevDLCFailure = false;
+            final boolean testDevRedirectLinksFailure = false;
+            final ArrayList<DownloadLink> thisMirrorResults = new ArrayList<DownloadLink>();
+            final ArrayList<DownloadLink> cnlResults;
+            // cldHandling: if (true) {
+            cldHandling: if (thisMirrorResults.isEmpty()) {
+                if (testDevCnlFailure && DebugMode.TRUE_IN_IDE_ELSE_FALSE) {
+                    logger.warning("CNL failure test active!");
+                    cnlResults = new ArrayList<DownloadLink>();
+                    break cldHandling;
+                }
+                cnlResults = handleCnl2(contenturl, successfullyUsedFolderPassword);
+                if (cnlResults.isEmpty()) {
+                    logger.info("Failed to find CNL results");
+                    break cldHandling;
+                }
+                logger.info("CNL success");
+                for (final DownloadLink link : cnlResults) {
+                    if (fp != null) {
+                        link._setFilePackage(fp);
+                    }
+                    if (extractionPasswordList != null) {
+                        link.setSourcePluginPasswordList(extractionPasswordList);
+                    }
+                    distribute(link);
+                    thisMirrorResults.add(link);
+                }
+            }
+            dlcContainerHandling: if (thisMirrorResults.isEmpty()) {
+                /* Second try DLC, then single links */
+                logger.info("CNL failure -> Trying DLC");
+                if (testDevDLCFailure && DebugMode.TRUE_IN_IDE_ELSE_FALSE) {
+                    logger.warning("DLC failure test active!");
+                    break dlcContainerHandling;
+                }
+                String dlc_id = br.getRegex("DownloadDLC\\('([^<>\"]*?)'\\)").getMatch(0);
+                if (dlc_id == null) {
+                    /* 2023-02-13 */
+                    dlc_id = br.getRegex("onclick=\"DownloadDLC[^\\(]*\\('([^']+)'").getMatch(0);
+                    if (dlc_id == null) {
+                        /* 2023-04-06 */
+                        dlc_id = br.getRegex("class=\"dlcdownload\"[^>]* onclick=\"[^\\(]+\\('([^\\']+)").getMatch(0);
+                        if (dlc_id == null) {
+                            /* 2024-01-25 */
+                            dlc_id = br.getRegex("DownloadDLC\\('([^\\']+)'\\)").getMatch(0);
+                            if (dlc_id == null) {
+                                /* 2025-07-28 */
+                                dlc_id = br.getRegex("onclick=\"DownloadDLC[^\"]+\" data-[a-zA-Z0-9]+=\"([^\"]+)").getMatch(0);
+                            }
+                        }
+                    }
+                }
+                if (dlc_id == null) {
+                    logger.info("Failed to find DLC container");
+                    break dlcContainerHandling;
+                }
+                logger.info("DLC found - trying to add it");
+                final Browser brc = br.cloneBrowser();
+                final List<DownloadLink> dlcResults = loadContainerFile(brc, brc.createGetRequest("/DLC/" + dlc_id + ".dlc"), Collections.singletonMap("extension", ".dlc"));
+                if (dlcResults == null || dlcResults.isEmpty()) {
+                    logger.warning("DLC for current mirror is empty or something is broken!");
+                    break dlcContainerHandling;
+                }
+                logger.info("DLC success");
+                for (final DownloadLink link : dlcResults) {
+                    if (fp != null) {
+                        link._setFilePackage(fp);
+                    }
+                    if (extractionPasswordList != null) {
+                        link.setSourcePluginPasswordList(extractionPasswordList);
+                    }
+                    distribute(link);
+                    thisMirrorResults.add(link);
+                }
+            }
+            redirectLinksHandling: if (thisMirrorResults.isEmpty()) {
+                /* Last resort: Try most time intensive way to crawl links: Crawl each link individually. */
+                logger.info("Trying single link redirect handling");
+                if (testDevRedirectLinksFailure && DebugMode.TRUE_IN_IDE_ELSE_FALSE) {
+                    logger.warning("Redirect handling failure test active!");
+                    break redirectLinksHandling;
+                }
+                String[] links = br.getRegex("<button[^<>]+\\sdata-[0-9a-z]{5,}=\"([^\"]+)").getColumn(0);
+                if (links == null || links.length == 0) {
+                    logger.info("Failed to find redirectLinks");
+                    break redirectLinksHandling;
+                }
+                final Browser brc = br.cloneBrowser();
+                brc.setFollowRedirects(false);
+                brc.setCookie(br.getHost(), "BetterJsPopCount", "1");
+                int index = -1;
+                final HashSet<String> dupes = new HashSet<String>();
+                final String[] filenames = br.getRegex("<td title=\"([^\"]+)\">[^<]+<span><a href=[^>]*class=\"external_link\"").getColumn(0);
+                final String[] filesizes = br.getRegex("</a></span></td><td>(\\d+[^<]+)</td>").getColumn(0);
+                redirectLinksLoop: for (final String singleLink : links) {
+                    index++;
+                    logger.info("Processing redirectLinksLoop position: " + index + "/" + links.length + " | " + singleLink);
+                    if (!dupes.add(singleLink)) {
+                        logger.info("Skipping dupe: " + singleLink);
+                        continue;
+                    }
+                    String finallink = null;
+                    int retryLink = 2;
+                    singleRedirectLinkLoop: while (!isAbort()) {
+                        finallink = handleLink(brc, param, singleLink, 0);
+                        if (StringUtils.equals("IGNORE", finallink)) {
+                            continue singleRedirectLinkLoop;
+                        } else if (finallink != null || --retryLink == 0) {
+                            logger.info(singleLink + " -> " + finallink + " | " + retryLink);
+                            break singleRedirectLinkLoop;
+                        }
+                    }
+                    if (finallink == null) {
+                        logger.warning("Failed to find any result for: " + singleLink);
+                        continue;
+                    }
+                    final DownloadLink link = createDownloadlink(finallink);
+                    if (fp != null) {
+                        link._setFilePackage(fp);
+                    }
+                    if (extractionPasswordList != null) {
+                        link.setSourcePluginPasswordList(extractionPasswordList);
+                    }
+                    /* Set weak file name/size if that information is found. */
+                    if (filenames != null && filenames.length == links.length) {
+                        String filename = filenames[index];
+                        filename = Encoding.htmlDecode(filename).trim();
+                        link.setName(filename);
+                    }
+                    if (filesizes != null && filesizes.length == links.length) {
+                        String filesize = filenames[index];
+                        filesize = Encoding.htmlDecode(filesize).trim();
+                        link.setDownloadSize(SizeFormatter.getSize(filesize));
+                    }
+                    thisMirrorResults.add(link);
+                    distribute(link);
+                    if (isAbort()) {
+                        logger.info("Stopping because: Aborted by user");
+                        break redirectLinksLoop;
+                    }
+                }
+            }
+            logger.info("Mirror " + currentMirrorID + " results: " + thisMirrorResults.size());
+            if (thisMirrorResults.isEmpty()) {
+                if (mirrorLooksToBeOffline) {
+                    logger.info("Skipping mirror which looks to be offline: " + mirrorurl);
+                    numberofOfflineMirrors++;
+                    continue;
+                } else if (mirrorLooksToBeAdvertisement) {
+                    logger.info("Skipping fake advertisement mirror: " + mirrorurl);
+                    numberofSkippedFakeAdvertisementMirrors++;
+                    continue;
+                } else {
+                    logger.warning("Failed at mirror: " + mirrorurl);
+                    throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+                }
+            }
+            ret.addAll(thisMirrorResults);
+            if (cfg.getCrawlMode() == CrawlMode.PREFER_GIVEN_MIRROR_ID && mirrorIdFromAddedURL != null && currentMirrorID.equals(mirrorIdFromAddedURL)) {
+                logger.info("Stopping because: Found user desired mirror: " + mirrorIdFromAddedURL);
+                break mirrorLoop;
+            }
+        }
+        if (ret.isEmpty()) {
+            if (numberofOfflineMirrors == mirror_urls.size() - numberofSkippedFakeAdvertisementMirrors) {
+                /* In this case filecrypt is only using the link to show ads. */
+                logger.info("All mirrors are offline and only fake mirrors/usenet/ads exist -> Whole folder is offline");
+                throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+            } else if (numberofOfflineMirrors == mirror_urls.size() - numberofSkippedFakeAdvertisementMirrors) {
+                /* In this case filecrypt is only using the link to show ads. */
+                logger.info("All mirrors are offline -> Whole folder is offline");
+                throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+            } else {
+                throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+            }
+        }
+        return ret;
+    }
+
+    private boolean looksLikeUploaderHasDeactivatedAllMirrors(final Browser br) {
+        if (br.containsHTML(">\\s*Der Inhaber dieses Ordners hat leider alle Hoster in diesem Container in seinen Einstellungen deaktiviert")) {
+            return true;
+        } else if (br.containsHTML(">\\s*The owner of this folder has deactivated all hosts in this container in their settings")) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean handlePassword(final CryptedLink param) throws Exception {
+        final List<String> passwords = getPreSetPasswords();
+        final HashSet<String> usedWrongPasswords = new HashSet<String>();
+        int passwordCounter = 0;
+        final int maxPasswordRetries = 3;
+        final String[] possiblePasswordFieldKeys = new String[] { "password", "pssw", "password__" };
+        /* Initialize logo password if available */
+        final String logoPassword = initializeLogoPassword();
+        if (logoPassword != null) {
+            /* Try logoPW first */
+            passwords.add(0, logoPassword);
+        }
+        passwordLoop: while (true) {
+            passwordCounter++;
+            if (passwordCounter > maxPasswordRetries) {
+                logger.info("Stopping because: Too many wrong password attempts");
+                break passwordLoop;
+            }
+            logger.info("Password attempt: " + passwordCounter + " / " + maxPasswordRetries);
+            /* Find the password form */
+            final Form passwordForm = findPasswordForm(possiblePasswordFieldKeys);
+            if (passwordForm == null) {
+                throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT, "Failed to find password Form");
+            }
+            final String passwordFieldKey = getPasswordFieldKey(passwordForm, possiblePasswordFieldKeys);
+            if (StringUtils.isEmpty(passwordFieldKey)) {
+                throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT, "passwordFieldKey can't be empty");
+            }
+            /* Get next password that hasn't been tried yet */
+            String passCode = getNextPassword(passwords, usedWrongPasswords);
+            if (passCode == null) {
+                /* Ask user for password */
+                passCode = getUserInput("Password?", param);
+                if (StringUtils.isEmpty(passCode)) {
+                    throw new DecrypterException(DecrypterException.PASSWORD);
+                }
+                if (usedWrongPasswords.contains(passCode)) {
+                    logger.info("Skipping user-entered already tried wrong password: " + passCode);
+                    continue;
+                }
+            }
+            /* Submit password */
+            passwordForm.put(passwordFieldKey, Encoding.urlEncode(passCode));
+            submitForm(passwordForm);
+            /* Check if password was correct */
+            if (!containsPassword(this.cleanHTML)) {
+                logger.info("Password success: " + passCode);
+                successfullyUsedFolderPassword = passCode;
+                /* Save correct password for future usage */
+                if (!StringUtils.equals(this.getPluginConfig().getStringProperty(PROPERTY_PLUGIN_LAST_USED_PASSWORD), successfullyUsedFolderPassword)) {
+                    /* Only log this if the password differs from the old value. */
+                    logger.info("Saving correct password for future usage: " + successfullyUsedFolderPassword);
+                }
+                this.getPluginConfig().setProperty(PROPERTY_PLUGIN_LAST_USED_PASSWORD, successfullyUsedFolderPassword);
+                return true;
+            } else {
+                logger.info("Password failure | Wrong password: " + passCode);
+                usedWrongPasswords.add(passCode);
+                continue passwordLoop;
+            }
+        }
+        if (passwordCounter >= maxPasswordRetries && containsPassword(this.cleanHTML)) {
+            throw new DecrypterException(DecrypterException.PASSWORD);
+        }
+        return false;
+    }
+
+    private static final Map<String, String> LOGO_PASSWORD_MAP = new HashMap<String, String>();
+    static {
+        final String pw_sfans = "serienfans.org";
+        LOGO_PASSWORD_MAP.put("53d1b", pw_sfans);
+        LOGO_PASSWORD_MAP.put("80d13", pw_sfans);
+        LOGO_PASSWORD_MAP.put("fde1d", pw_sfans);
+        LOGO_PASSWORD_MAP.put("8abe0", pw_sfans);
+        LOGO_PASSWORD_MAP.put("8f073", pw_sfans);
+        LOGO_PASSWORD_MAP.put("48544", pw_sfans);
+        LOGO_PASSWORD_MAP.put("975e4", "filmfans.org");
+        LOGO_PASSWORD_MAP.put("51967", "kellerratte");
+        LOGO_PASSWORD_MAP.put("aaf75", "cs.rin.ru");
+    }
+
+    private String initializeLogoPassword() {
+        if (logoPW != null) {
+            return logoPW;
+        }
+        /**
+         * Search password based on folder-logo. </br> Only do this one time in the first run of this loop.
+         */
+        final String customLogoID = br.getRegex("(?:logo|custom)/([a-z0-9]+)\\.png").getMatch(0);
+        if (customLogoID != null) {
+            /**
+             * Magic auto passwords: </br> Creators can set custom logos on each folder. Each logo has a unique ID. This way we can try
+             * specific passwords first that are typically associated with folders published by those sources.
+             */
+            final String password = getLogoPassword(customLogoID);
+            if (password != null) {
+                logger.info("Found possible PW by logoID: " + password);
+                logoPW = password;
+                return password;
+            }
+            logger.info("Found unknown logoID: " + customLogoID);
+            return null;
+        }
+        logger.info("Failed to find logoID via regex, trying fallback method");
+        /* Fallback: Check all known logo IDs by searching for their PNG references in HTML */
+        final java.util.Iterator<String> iterator = LOGO_PASSWORD_MAP.keySet().iterator();
+        while (iterator.hasNext()) {
+            final String logoID = iterator.next();
+            if (br.containsHTML("/" + logoID + "\\.png")) {
+                final String password = LOGO_PASSWORD_MAP.get(logoID);
+                logger.info("Found logoID via fallback search: " + logoID + " | LogoPW: " + password);
+                logoPW = password;
+                return password;
+            }
+        }
+        logger.info("Failed to find logoID via fallback method");
+        return null;
+    }
+
+    private String getLogoPassword(final String customLogoID) {
+        if (customLogoID == null) {
+            return null;
+        }
+        return LOGO_PASSWORD_MAP.get(customLogoID);
+    }
+
+    private Form findPasswordForm(final String[] possiblePasswordFieldKeys) {
+        final Form[] allForms = br.getForms();
+        if (allForms == null || allForms.length == 0) {
+            return null;
+        }
+        for (int i = 0; i < allForms.length; i++) {
+            final Form aForm = allForms[i];
+            for (int j = 0; j < possiblePasswordFieldKeys.length; j++) {
+                if (aForm.hasInputFieldByName(possiblePasswordFieldKeys[j])) {
+                    logger.info("Found password form by hasInputFieldByName(passwordFieldKey) | passwordFieldKey = " + possiblePasswordFieldKeys[j]);
+                    return aForm;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String getPasswordFieldKey(final Form passwordForm, final String[] possiblePasswordFieldKeys) {
+        for (int i = 0; i < possiblePasswordFieldKeys.length; i++) {
+            if (passwordForm.hasInputFieldByName(possiblePasswordFieldKeys[i])) {
+                return possiblePasswordFieldKeys[i];
+            }
+        }
+        return null;
+    }
+
+    private String getNextPassword(final List<String> passwords, final HashSet<String> usedWrongPasswords) {
+        while (passwords.size() > 0) {
+            final String pw = passwords.remove(0);
+            if (!usedWrongPasswords.contains(pw)) {
+                return pw;
+            }
+            logger.info("Skipping already tried wrong password: " + pw);
+        }
+        return null;
+    }
+
+    private void handlePasswordAndCaptcha(final CryptedLink param, final String folderID, final String url) throws Exception {
+        final String host;
+        if (br.getRequest() != null) {
+            host = br.getHost();
+        } else {
+            host = Browser.getHost(url);
+        }
+        br.setCookie(host, "lang", "en");
+        this.getPage(url);
+        if (br.getHttpConnection().getResponseCode() == 404) {
+            throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+        } else if (br.getURL().matches("(?i)https?://[^/]+/404\\.html.*")) {
+            throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+        } else if (br.containsHTML(">\\s*Dieser Ordner enthält keine Mirror")) {
+            throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+        }
+        if (containsPassword(this.cleanHTML)) {
+            handlePassword(param);
+        }
+        if (!containsCaptcha(this.cleanHTML)) {
+            logger.info("Looks like no captcha is required");
+            return;
+        } else {
+            logger.info("Looks like a captcha is required");
+        }
+        int captchaCounter = -1;
+        final int maxCaptchaRetries = 10;
+        captchaLoop: while (captchaCounter++ < maxCaptchaRetries && !this.isAbort()) {
+            logger.info("Captcha loop: " + captchaCounter + "/" + maxCaptchaRetries);
+            Form captchaForm = null;
+            final Form[] forms = br.getForms();
+            if (forms != null && forms.length != 0) {
+                for (final Form form : forms) {
+                    if (form.containsHTML("captcha") || AbstractRecaptchaV2.containsRecaptchaV2Class(form)) {
+                        captchaForm = form;
+                        break;
+                    } else if (form.containsHTML("cform")) {
+                        captchaForm = form;
+                        break;
+                    }
+                }
+            }
+            if (captchaForm == null) {
+                throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT, "Failed to find captchaForm");
+            }
+            final String captchaURL = captchaForm.getRegex("((https?://[^<>\"']*?)?/captcha/[^<>\"']*?)\"").getMatch(0);
+            if (captchaURL != null && this.containsCircleCaptcha(captchaURL)) {
+                final ClickedPoint cp = getCaptchaClickedPoint(getHost(), getCaptchaImage(captchaURL), param, "Click on the open circle");
+                if (cp == null) {
+                    throw new PluginException(LinkStatus.ERROR_CAPTCHA);
+                }
+                final InputField button = captchaForm.getInputFieldByType(InputField.InputType.IMAGE.name());
+                if (button == null) {
+                    throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+                }
+                captchaForm.removeInputField(button);
+                captchaForm.put(button.getKey() + ".x", String.valueOf(cp.getX()));
+                captchaForm.put(button.getKey() + ".y", String.valueOf(cp.getY()));
+            } else if (captchaForm != null && captchaForm.containsHTML("=\"g-recaptcha\"")) {
+                final String recaptchaV2Response = new CaptchaHelperCrawlerPluginRecaptchaV2(this, br).getToken();
+                captchaForm.put("g-recaptcha-response", Encoding.urlEncode(recaptchaV2Response));
+            } else if (StringUtils.containsIgnoreCase(captchaURL, "cutcaptcha")) {
+                logger.info("Attempting to solve CutCaptcha");
+                final String cutcaptchaToken = new CaptchaHelperCrawlerPluginCutCaptcha(this, br, null).getToken();
+                captchaForm.put("cap_token", Encoding.urlEncode(cutcaptchaToken));
+            } else {
+                final String code = getCaptchaCode(captchaURL, param);
+                captchaForm.put("recaptcha_response_field", Encoding.urlEncode(code));
+            }
+            submitForm(captchaForm);
+            if (this.containsCaptcha(this.cleanHTML)) {
+                logger.info("User entered wrong captcha");
+                this.invalidateLastChallengeResponse();
+                continue captchaLoop;
+            } else {
+                logger.info("User entered correct captcha");
+                this.validateLastChallengeResponse();
+                return;
+            }
+        }
+        throw new DecrypterRetryException(RetryReason.CAPTCHA);
+    }
+
+    private String handleLink(final Browser br, final CryptedLink param, final String singleLink, final int round) throws Exception {
+        if (round >= 5) {
+            /* Prevent endless recursive loop */
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+        final String domainPattern = buildHostsPatternPart(getPluginDomains().get(0));
+        if (StringUtils.startsWithCaseInsensitive(singleLink, "http://") || StringUtils.startsWithCaseInsensitive(singleLink, "https://")) {
+            br.getPage(singleLink);
+        } else {
+            br.getPage("/Link/" + singleLink + ".html");
+        }
+        if (br.containsHTML("friendlyduck\\.com/") || br.containsHTML(domainPattern + "/usenet\\.html") || br.containsHTML("powerusenet.xyz")) {
+            /* Advertising */
+            return "IGNORE";
+        }
+        int retryCaptcha = 5;
+        while (!isAbort() && retryCaptcha-- > 0) {
+            if (containsCaptcha(br.getRequest().getHtmlCode())) {
+                /* Rare case: Captcha required to access single link. */
+                final String captcha = br.getRegex("(/captcha/[^<>\"]*?)\"").getMatch(0);
+                if (captcha == null || !captcha.contains("circle.php")) {
+                    logger.warning("Unsupported/unexpected captcha for single redirect link.");
+                    throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+                }
+                final ClickedPoint cp = getCaptchaClickedPoint(getHost(), getCaptchaImage(captcha), param, "Click on the open circle");
+                if (cp == null) {
+                    throw new PluginException(LinkStatus.ERROR_CAPTCHA);
+                }
+                final Form form = new Form();
+                form.setMethod(MethodType.POST);
+                form.setAction(br.getURL());
+                form.put("button.x", String.valueOf(cp.getX()));
+                form.put("button.y", String.valueOf(cp.getY()));
+                form.put("button", "send");
+                br.submitForm(form);
+            } else {
+                break;
+            }
+        }
+        String finallink = null;
+        final String first_rd = br.getRedirectLocation();
+        if (first_rd != null && first_rd.matches(".*" + domainPattern + "/.*")) {
+            return handleLink(br, param, first_rd, round + 1);
+        } else if (first_rd != null && !first_rd.matches(".*" + domainPattern + "/.*")) {
+            finallink = first_rd;
+        } else {
+            String nextlink = br.getRegex("(\"|')(https?://[^/]+/index\\.php\\?Action=(G|g)o[^<>\"']+)").getMatch(1);
+            if (nextlink == null) {
+                nextlink = br.getRegex("(\"|')(https?://[^/]+/Go/[^<>\"']+)").getMatch(1);
+            }
+            if (nextlink != null) {
+                return handleLink(br, param, nextlink, round + 1);
+            }
+        }
+        if (finallink == null) {
+            return null;
+        } else if (this.canHandle(finallink)) {
+            return null;
+        } else {
+            return finallink;
+        }
+    }
+
+    private ArrayList<DownloadLink> handleCnl2(final String url, final String password) throws Exception {
+        final ArrayList<DownloadLink> ret = new ArrayList<DownloadLink>();
+        final Form[] forms = br.getForms();
+        Form CNLPOP = null;
+        for (final Form f : forms) {
+            if (f.containsHTML("CNLPOP") || f.containsHTML("cnlform")) {
+                CNLPOP = f;
+                break;
+            }
+        }
+        Form cnl = null;
+        if (CNLPOP != null) {
+            final String infos[] = CNLPOP.getRegex("'(.*?)'").getColumn(0);
+            cnl = new Form();
+            cnl.addInputField(new InputField("crypted", infos[2]));
+            cnl.addInputField(new InputField("jk", "function f(){ return \'" + infos[1] + "';}"));
+            cnl.addInputField(new InputField("source", null));
+        } else {
+            /* 2nd attempt */
+            for (final Form f : forms) {
+                if (f.hasInputFieldByName("jk")) {
+                    cnl = f;
+                    break;
+                }
+            }
+        }
+        if (cnl == null) {
+            return ret;
+        }
+        final Map<String, String> infos = new HashMap<String, String>();
+        infos.put("crypted", Encoding.urlDecode(cnl.getInputField("crypted").getValue(), false));
+        infos.put("jk", Encoding.urlDecode(cnl.getInputField("jk").getValue(), false));
+        String source = cnl.getInputField("source").getValue();
+        if (StringUtils.isEmpty(source)) {
+            source = url;
+        } else {
+            infos.put("source", source);
+        }
+        infos.put("source", source);
+        if (password != null) {
+            infos.put("passwords", password);
+        }
+        final String json = JSonStorage.serializeToJson(infos);
+        final DownloadLink dl = createDownloadlink("http://dummycnl.jdownloader.org/" + HexFormatter.byteArrayToHex(json.getBytes("UTF-8")));
+        ret.add(dl);
+        return ret;
+    }
+
+    private final boolean containsCaptcha(final String html) {
+        /* 2025-07-28: Added "Security check" */
+        if (new Regex(html, ">\\s*(?:Sicherheitsüberprüfung|Security prompt|Security check)\\s*</").patternFind()) {
+            return true;
+        } else if (containsCircleCaptcha(html)) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    private final boolean containsCircleCaptcha(final String str) {
+        if (StringUtils.containsIgnoreCase(str, "circle.php")) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    private final boolean containsPassword(final String html) {
+        if (new Regex(html, "(?i)>\\s*(?:Passwort erforderlich|Password required)\\s*</").patternFind()) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    private String cleanHTML = null;
+
+    private final void cleanUpHTML(final Browser br) {
+        String toClean = br.getRequest().getHtmlCode();
+        final ArrayList<String> regexStuff = new ArrayList<String>();
+        // generic cleanup
+        regexStuff.add("<!(--.*?--)>");
+        regexStuff.add("(<\\s*(\\w+)\\s+[^>]*style\\s*=\\s*(\"|')(?:(?:[\\w:;\\s#-]*(visibility\\s*:\\s*hidden;|display\\s*:\\s*none;|font-size\\s*:\\s*0;)[\\w:;\\s#-]*)|font-size\\s*:\\s*0|visibility\\s*:\\s*hidden|display\\s*:\\s*none)\\3[^>]*(>.*?<\\s*/\\2[^>]*>|/\\s*>))");
+        for (String aRegex : regexStuff) {
+            String results[] = new Regex(toClean, aRegex).getColumn(0);
+            if (results != null) {
+                for (String result : results) {
+                    toClean = toClean.replace(result, "");
+                }
+            }
+        }
+        cleanHTML = toClean;
+    }
+
+    private final void getPage(final String page) throws Exception {
+        if (page == null) {
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+        br.getPage(page);
+        cleanUpHTML(br);
+    }
+
+    private final void postPage(final String url, final String post) throws Exception {
+        if (url == null || post == null) {
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+        br.postPage(url, post);
+        cleanUpHTML(br);
+    }
+
+    private final void submitForm(final Form form) throws Exception {
+        if (form == null) {
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+        br.submitForm(form);
+        cleanUpHTML(br);
+    }
+
+    @Override
+    public Class<? extends FileCryptConfig> getConfigInterface() {
+        return FileCryptConfig.class;
+    }
+}

@@ -1,0 +1,263 @@
+//jDownloader - Downloadmanager
+//Copyright (C) 2009  JD-Team support@jdownloader.org
+//
+//This program is free software: you can redistribute it and/or modify
+//it under the terms of the GNU General Public License as published by
+//the Free Software Foundation, either version 3 of the License, or
+//(at your option) any later version.
+//
+//This program is distributed in the hope that it will be useful,
+//but WITHOUT ANY WARRANTY; without even the implied warranty of
+//MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//GNU General Public License for more details.
+//
+//You should have received a copy of the GNU General Public License
+//along with this program.  If not, see <http://www.gnu.org/licenses/>.
+package jd.plugins.hoster;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+import org.appwork.storage.TypeRef;
+import org.appwork.utils.StringUtils;
+import org.jdownloader.plugins.controller.LazyPlugin;
+import org.jdownloader.scripting.JavaScriptEngineFactory;
+
+import jd.PluginWrapper;
+import jd.http.Browser;
+import jd.nutils.encoding.Encoding;
+import jd.parser.Regex;
+import jd.plugins.DownloadLink;
+import jd.plugins.DownloadLink.AvailableStatus;
+import jd.plugins.HostPlugin;
+import jd.plugins.LinkStatus;
+import jd.plugins.PluginException;
+import jd.plugins.PluginForHost;
+import jd.plugins.components.PluginJSonUtils;
+import jd.plugins.components.SiteType.SiteTemplate;
+
+@HostPlugin(revision = "$Revision: 51660 $", interfaceVersion = 2, names = {}, urls = {})
+public class UnknownPornScript9 extends PluginForHost {
+    public UnknownPornScript9(PluginWrapper wrapper) {
+        super(wrapper);
+    }
+
+    @Override
+    public Browser createNewBrowserInstance() {
+        final Browser br = super.createNewBrowserInstance();
+        br.setFollowRedirects(true);
+        return br;
+    }
+
+    @Override
+    public LazyPlugin.FEATURE[] getFeatures() {
+        return new LazyPlugin.FEATURE[] { LazyPlugin.FEATURE.XXX };
+    }
+
+    private static final Pattern TYPE_NORMAL = Pattern.compile("/(?:[a-z]{2}/)?video/(\\d+)(/([a-z0-9-]+))?", Pattern.CASE_INSENSITIVE);
+    /* 2025-10-13: e.g. available for: viptube.com, iceporn.com, nuvid.com */
+    private static final Pattern TYPE_EMBED  = Pattern.compile("/embed/(\\d+)", Pattern.CASE_INSENSITIVE);
+
+    public static List<String[]> getPluginDomains() {
+        final List<String[]> ret = new ArrayList<String[]>();
+        ret.add(new String[] { "winporn.com" });
+        ret.add(new String[] { "proporn.com" });
+        ret.add(new String[] { "vivatube.com" });
+        ret.add(new String[] { "tubeon.com" });
+        ret.add(new String[] { "viptube.com" });
+        ret.add(new String[] { "hd21.com" });
+        ret.add(new String[] { "iceporn.com" });
+        ret.add(new String[] { "nuvid.com" });
+        ret.add(new String[] { "yeptube.com" });
+        return ret;
+    }
+
+    public static String[] getAnnotationNames() {
+        return buildAnnotationNames(getPluginDomains());
+    }
+
+    @Override
+    public String[] siteSupportedNames() {
+        return buildSupportedNames(getPluginDomains());
+    }
+
+    public static String[] getAnnotationUrls() {
+        return buildAnnotationUrls(getPluginDomains());
+    }
+
+    public static String[] buildAnnotationUrls(final List<String[]> pluginDomains) {
+        final List<String> ret = new ArrayList<String>();
+        for (final String[] domains : pluginDomains) {
+            ret.add("https?://(?:www\\.)?" + buildHostsPatternPart(domains) + "(" + TYPE_NORMAL.pattern() + "|" + TYPE_EMBED.pattern() + ")");
+        }
+        return ret.toArray(new String[0]);
+    }
+
+    /* Similar sites but they use a different 'player_config' URL: drtuber.com, viptube.com */
+    /* Connection stuff */
+    private final boolean free_resume    = true;
+    private int           free_maxchunks = 0;
+    private String        dllink         = null;
+
+    @Override
+    public String getAGBLink() {
+        return "https://www." + getHost() + "/static/terms";
+    }
+
+    @Override
+    public String getLinkID(final DownloadLink link) {
+        final String linkid = getFID(link);
+        if (linkid != null) {
+            return this.getHost() + "://" + linkid;
+        } else {
+            return super.getLinkID(link);
+        }
+    }
+
+    private String getFID(final DownloadLink link) {
+        String fid = new Regex(link.getPluginPatternMatcher(), TYPE_NORMAL).getMatch(0);
+        if (fid != null) {
+            return fid;
+        }
+        fid = new Regex(link.getPluginPatternMatcher(), TYPE_EMBED).getMatch(0);
+        return fid;
+    }
+
+    /** Items with different FUIDs but same filenames should not get treated as mirrors! */
+    @Override
+    public String getMirrorID(DownloadLink link) {
+        final String fid = getFID(link);
+        if (link != null && StringUtils.equals(getHost(), link.getHost()) && fid != null) {
+            return getHost() + "://" + fid;
+        } else {
+            return super.getMirrorID(link);
+        }
+    }
+
+    @Override
+    public AvailableStatus requestFileInformation(final DownloadLink link) throws Exception {
+        dllink = null;
+        final String extDefault = ".mp4";
+        final String fid = this.getFID(link);
+        if (!link.isNameSet()) {
+            link.setName(fid + extDefault);
+        }
+        this.setBrowserExclusive();
+        /* Avoid mobile subdomain since official video download is sometimes broken on mobile website version e.g. winporn.com */
+        final String contenturl = link.getPluginPatternMatcher().replaceFirst("^https?://m\\.", "https://");
+        br.getPage(contenturl);
+        if (br.getHttpConnection().getResponseCode() == 404) {
+            throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+        } else if (br.containsHTML("class=\"notifications__item notifications__item-error\"")) {
+            throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+        }
+        String url_title = new Regex(br.getURL(), TYPE_NORMAL).getMatch(2);
+        if (new Regex(br.getURL(), TYPE_EMBED).patternFind()) {
+            /* Find better fallback filename for embed URLs e.g. iceporn.com */
+            String original_url = br.getRegex("target_url=(http[^&]+)").getMatch(0);
+            if (original_url != null) {
+                original_url = Encoding.htmlDecode(original_url);
+                url_title = new Regex(original_url, TYPE_NORMAL).getMatch(2);
+            }
+        }
+        final boolean isDownload = PluginEnvironment.DOWNLOAD.equals(this.getPluginEnvironment());
+        final boolean fetchDirecturlOnlyOnDownload = true;
+        String title = null;
+        if (!fetchDirecturlOnlyOnDownload || isDownload) {
+            String config_url = br.getRegex("(?:config_url|configUrl)\\s*:\\s*'(.*?)'").getMatch(0);
+            if (br.containsHTML("/video/download/" + fid) && config_url == null) {
+                /**
+                 * e.g. winporn.com, hd21.com <br>
+                 * Important: This does not mean that official download will really work e.g. <br>
+                 * Example official DL not working (hd21):
+                 * /pt/video/110124/wonderful-blonde-screams-with-pleasure-as-a-hard-stick-invades-her-ass
+                 */
+                /* Alternative: download via mobile website: m.hd21.com -> /mp4/110124 */
+                dllink = "/video/download/save/" + fid;
+            } else {
+                /* e.g. vivatube.com, hd21.com */
+                /* Access player json */
+                final String videoid = PluginJSonUtils.getJson(br, "vid");
+                if (StringUtils.isEmpty(videoid)) {
+                    throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+                }
+                br.getHeaders().put("Accept", "application/json, text/javascript, */*; q=0.01");
+                br.getHeaders().put("X-Requested-With", "XMLHttpRequest");
+                String embed = br.getRegex("embed\\s*:\\s*(\\d+)").getMatch(0);
+                if (config_url == null) {
+                    /* Fallback */
+                    config_url = "/player_config_json/";
+                }
+                if (embed == null) {
+                    embed = "0";
+                }
+                br.getPage(String.format("%s?vid=%s&aid=&domain_id=&embed=%s&ref=&check_speed=0", config_url, videoid, embed));
+                final Map<String, Object> map = restoreFromString(br.getRequest().getHtmlCode(), TypeRef.MAP);
+                // final long has_hq = JavaScriptEngineFactory.toLong(map.get("has_hq"), 1);
+                /* Most reliable way to find filename */
+                title = (String) map.get("title");
+                /* Prefer hq */
+                dllink = (String) JavaScriptEngineFactory.walkJson(map, "files/hq");
+                if (dllink == null) {
+                    dllink = (String) JavaScriptEngineFactory.walkJson(map, "files/lq");
+                }
+            }
+        }
+        if (title == null) {
+            if (url_title != null) {
+                /* Prefer title from url */
+                title = url_title.replace("-", " ").trim();
+            } else {
+                title = br.getRegex("<title>([^<]+)").getMatch(0);
+            }
+        }
+        final String ext = getFileNameExtensionFromString(dllink, extDefault);
+        String filename = null;
+        if (title != null) {
+            title = Encoding.htmlDecode(title).trim();
+            /* Apply some small corrections e.g. for embed links from: iceporn.com, viptube.com, nuvid.com */
+            title = title.replaceFirst("(?i) - Free Porn Videos, Sex Movies\\. " + Pattern.quote(br.getHost(false)), "");
+            filename = title + ext;
+        }
+        link.setFinalFileName(filename);
+        if (!isDownload && dllink != null && !link.isSizeSet()) {
+            this.basicLinkCheck(br, br.createGetRequest(this.dllink), link, filename, ext);
+        }
+        return AvailableStatus.TRUE;
+    }
+
+    @Override
+    public void handleFree(final DownloadLink link) throws Exception {
+        requestFileInformation(link);
+        if (StringUtils.isEmpty(dllink)) {
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+        if (StringUtils.containsIgnoreCase(link.getPluginPatternMatcher(), "iceporn") || StringUtils.containsIgnoreCase(link.getPluginPatternMatcher(), "viptube")) {
+            free_maxchunks = 1; // https://svn.jdownloader.org/issues/84428, /84735
+        }
+        dl = jd.plugins.BrowserAdapter.openDownload(br, link, dllink, free_resume, free_maxchunks);
+        if (!looksLikeDownloadableContent(dl.getConnection())) {
+            br.followConnection(true);
+            if (dl.getConnection().getResponseCode() == 403) {
+                throw new PluginException(LinkStatus.ERROR_TEMPORARILY_UNAVAILABLE, "Server error 403", 60 * 60 * 1000l);
+            } else if (dl.getConnection().getResponseCode() == 404) {
+                throw new PluginException(LinkStatus.ERROR_TEMPORARILY_UNAVAILABLE, "Server error 404", 60 * 60 * 1000l);
+            } else {
+                throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+            }
+        }
+        dl.startDownload();
+    }
+
+    @Override
+    public int getMaxSimultanFreeDownloadNum() {
+        return Integer.MAX_VALUE;
+    }
+
+    @Override
+    public SiteTemplate siteTemplateType() {
+        return SiteTemplate.UnknownPornScript9;
+    }
+}

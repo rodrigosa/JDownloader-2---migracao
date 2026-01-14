@@ -1,0 +1,6 @@
+rootProject.name = 'JDownloader2'
+
+include 'AppWorkUtils'
+include 'browser'
+include 'MyJDownloaderClient'
+include 'trunk'

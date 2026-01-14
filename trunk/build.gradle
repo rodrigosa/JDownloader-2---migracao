@@ -1,0 +1,88 @@
+plugins {
+    id 'java-library'
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = ['src']
+        }
+        resources {
+            srcDirs = ['src', 'translations', 'themes', 'ressourcen']
+            exclude '**/*.java'
+            exclude 'libs/**'
+            exclude 'libs_ext/**'
+        }
+    }
+}
+
+dependencies {
+    implementation project(':AppWorkUtils')
+    implementation project(':browser')
+    implementation project(':MyJDownloaderClient')
+    
+    implementation fileTree(dir: 'ressourcen/libs', include: ['**/*.jar'])
+    implementation fileTree(dir: 'ressourcen/libs_ext', include: ['**/*.jar'])
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+}
+
+processResources {
+    // Replicate build.xml: Merge AppWorkUtils themes into JDownloader themes
+    from("${project(':AppWorkUtils').projectDir}/themes/themes/standard/org/appwork") {
+        into 'themes/standard/org/jdownloader'
+    }
+    
+    // Ensure regular resources are preserved (dup handling)
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+}
+
+// Task to prepare the runtime directory (mimics 'dist' from build.xml)
+task prepareRunHome(type: Copy) {
+    into "$buildDir/run-home"
+    
+    // Libs
+    from('ressourcen/libs') { into 'libs' }
+    from('ressourcen/libs_ext') { into 'libs' }
+    
+    // Themes (Main)
+    from('themes') { into 'themes' }
+    
+    // Themes (AppWorkUtils Merge)
+    from("${project(':AppWorkUtils').projectDir}/themes/themes/standard/org/appwork") {
+        into 'themes/themes/standard/org/jdownloader'
+    }
+    
+    // Other resources
+    from('ressourcen/jd') { into 'jd' }
+    from('ressourcen/tools') { into 'tools' }
+    from('translations') { into 'translations' }
+    
+    // Collect translations from modules
+    from("${project(':AppWorkUtils').projectDir}/src") { 
+        include '**/*.lng'
+        into 'translations' 
+    }
+    from("${project(':browser').projectDir}/src") { 
+        include '**/*.lng'
+        into 'translations' 
+    }
+    // trunk src translations
+    from('src') {
+        include '**/*.lng'
+        into 'translations'
+    }
+    
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+}
+
+// Ensure prepareRunHome runs before the app starts
+tasks.named('run') {
+    dependsOn prepareRunHome
+    // Cleanup old lock files if necessary?
+    
+    // Set the ROOT system property to point to our custom run directory
+    systemProperty 'ROOT', "$buildDir/run-home"
+    
+    // Set the working directory to the custom run-home
+    workingDir "$buildDir/run-home"
+}

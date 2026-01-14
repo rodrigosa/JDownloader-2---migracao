@@ -1,0 +1,164 @@
+//jDownloader - Downloadmanager
+//Copyright (C) 2009  JD-Team support@jdownloader.org
+//
+//This program is free software: you can redistribute it and/or modify
+//it under the terms of the GNU General Public License as published by
+//the Free Software Foundation, either version 3 of the License, or
+//(at your option) any later version.
+//
+//This program is distributed in the hope that it will be useful,
+//but WITHOUT ANY WARRANTY; without even the implied warranty of
+//MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//GNU General Public License for more details.
+//
+//You should have received a copy of the GNU General Public License
+//along with this program.  If not, see <http://www.gnu.org/licenses/>.
+package jd.plugins.decrypter;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Pattern;
+
+import org.appwork.utils.StringUtils;
+
+import jd.PluginWrapper;
+import jd.controlling.ProgressController;
+import jd.http.Browser;
+import jd.nutils.encoding.Encoding;
+import jd.plugins.CryptedLink;
+import jd.plugins.DecrypterPlugin;
+import jd.plugins.DownloadLink;
+import jd.plugins.FilePackage;
+import jd.plugins.LinkStatus;
+import jd.plugins.PluginException;
+import jd.plugins.PluginForDecrypt;
+
+@DecrypterPlugin(revision = "$Revision: 52081 $", interfaceVersion = 3, names = {}, urls = {})
+public class DramaCoolVideo extends PluginForDecrypt {
+    public DramaCoolVideo(PluginWrapper wrapper) {
+        super(wrapper);
+    }
+
+    public static final String DRAMACOOL_MAIN_DOMAIN = "asianc.sh";
+
+    public static List<String[]> getPluginDomains() {
+        final List<String[]> ret = new ArrayList<String[]>();
+        // each entry in List<String[]> will result in one PluginForDecrypt, Plugin.getHost() will return String[0]->main domain
+        ret.add(new String[] { DRAMACOOL_MAIN_DOMAIN, "dramacool.pa", "dramacool.cr", "dramacool.ch", "dramacool.bz", "dramacool.video", "dramacool.movie", "dramacool.so", "dramacool.link", "dramacool.vc", "dramacool.fo", "asianctv.com", "asianctv.net" });
+        /* 2026-01-12: Website is slightly different than other dramacool domains, thus I placed it in a separate array. */
+        ret.add(new String[] { "dramacool9.com.ro" });
+        ret.add(new String[] { "gogoanime3.co", "gogoanime3.net", "gogoanime.tel", "gogoanime.tv", "gogoanime.io", "gogoanime.vc", "gogoanime.sh", "gogoanime.gg", "gogoanime.run" });
+        ret.add(new String[] { "kisskh.com.ro" }); // 2026-01-12
+        return ret;
+    }
+
+    private static String[] getDeadDomains() {
+        return new String[] { "dramacool.link", "gogoanime.io", "gogoanime.sh" };
+    }
+
+    public static String[] getAnnotationNames() {
+        return buildAnnotationNames(getPluginDomains());
+    }
+
+    @Override
+    public String[] siteSupportedNames() {
+        return buildSupportedNames(getPluginDomains());
+    }
+
+    public static String[] getAnnotationUrls() {
+        return buildAnnotationUrls(getPluginDomains());
+    }
+
+    public static String[] buildAnnotationUrls(final List<String[]> pluginDomains) {
+        final List<String> ret = new ArrayList<String>();
+        for (final String[] domains : pluginDomains) {
+            ret.add("https?://(?:www\\d*\\.)?" + buildHostsPatternPart(domains) + "/[\\w\\-]+(\\.html)?");
+        }
+        return ret.toArray(new String[0]);
+    }
+
+    private boolean requiresHTMLEnding() {
+        if (this.getHost().equals(DRAMACOOL_MAIN_DOMAIN)) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    @Override
+    public ArrayList<DownloadLink> decryptIt(final CryptedLink param, ProgressController progress) throws Exception {
+        ArrayList<DownloadLink> ret = new ArrayList<DownloadLink>();
+        br.setFollowRedirects(true);
+        final String domainInAddedURL = Browser.getHost(param.getCryptedUrl(), true);
+        String includedDeadDomain = null;
+        for (final String deadDomain : getDeadDomains()) {
+            if (domainInAddedURL.contains(deadDomain)) {
+                includedDeadDomain = deadDomain;
+                break;
+            }
+        }
+        final String contenturl;
+        if (includedDeadDomain != null) {
+            /* Replace dead domain with our main domain which is hopefully working. Do not touch subdomains. */
+            final String newDomain = domainInAddedURL.replace(includedDeadDomain, this.getHost());
+            logger.info("Added URL contains dead domain " + includedDeadDomain + " | Using this full domain instead: " + newDomain);
+            contenturl = param.getCryptedUrl().replaceFirst(Pattern.quote(domainInAddedURL), newDomain);
+        } else {
+            contenturl = param.getCryptedUrl();
+        }
+        if (requiresHTMLEnding() && !StringUtils.endsWithCaseInsensitive(param.getCryptedUrl(), ".html")) {
+            /* Invalid URL */
+            throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+        }
+        br.getPage(contenturl);
+        if (br.getHttpConnection().getResponseCode() == 403) {
+            throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+        } else if (br.containsHTML("<title>403 Forbidden</title>")) {
+            /* 403 forbidden response with response code 200 */
+            throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+        } else if (br.getHttpConnection().getResponseCode() == 404) {
+            throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+        } else if (br.containsHTML(">\\s*404 Not Found")) {
+            /* 404 response with response code 200 */
+            throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+        }
+        String title = br.getRegex("<title>(?:Watch\\s+)([^<]+)\\s+\\|[\\s\\w]+").getMatch(0);
+        if (title == null) {
+            /* Fallback */
+            title = br._getURL().getPath().substring(1).replace("-", " ").trim();
+        }
+        {
+            /* 2026-01-12 */
+            final String[] vidbasic_embed_ids = br.getRegex("/streaming\\.php\\?id=([a-zA-Z0-9]{8,})").getColumn(0);
+            if (vidbasic_embed_ids != null && vidbasic_embed_ids.length > 0) {
+                for (final String vidbasic_embed_id : vidbasic_embed_ids) {
+                    ret.add(this.createDownloadlink("https://vidbasic.top/embed/" + vidbasic_embed_id));
+                }
+                return ret;
+            }
+        }
+        String[] links = br.getRegex("data-video=\"([^\"]+)\"\\s*>").getColumn(0);
+        if (links == null || links.length == 0) {
+            links = br.getRegex("<li>\\s*<a href=\"([^\"]+)\" class=\"img\">\\s*<span class=\"type[^\"]*\">").getColumn(0);
+        }
+        if (links == null || links.length == 0) {
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+        if (links != null && links.length > 0) {
+            for (String link : links) {
+                if (link.startsWith("/")) {
+                    link = br.getURL(link).toString();
+                }
+                // link = Encoding.htmlDecode(link);
+                ret.add(createDownloadlink(link));
+            }
+        }
+        if (title != null) {
+            final FilePackage fp = FilePackage.getInstance();
+            fp.setName(Encoding.htmlDecode(title).trim());
+            fp.setAllowMerge(true);
+            fp.addLinks(ret);
+        }
+        return ret;
+    }
+}

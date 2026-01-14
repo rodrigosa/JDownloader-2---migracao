@@ -1,0 +1,690 @@
+//jDownloader - Downloadmanager
+//Copyright (C) 2009  JD-Team support@jdownloader.org
+//
+//This program is free software: you can redistribute it and/or modify
+//it under the terms of the GNU General Public License as published by
+//the Free Software Foundation, either version 3 of the License, or
+//(at your option) any later version.
+//
+//This program is distributed in the hope that it will be useful,
+//but WITHOUT ANY WARRANTY; without even the implied warranty of
+//MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+//GNU General Public License for more details.
+//
+//You should have received a copy of the GNU General Public License
+//along with this program.  If not, see <http://www.gnu.org/licenses/>.
+package jd.plugins.decrypter;
+
+import java.io.UnsupportedEncodingException;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+
+import org.appwork.net.protocol.http.HTTPConstants;
+import org.appwork.storage.TypeRef;
+import org.appwork.utils.DebugMode;
+import org.appwork.utils.Files;
+import org.appwork.utils.Regex;
+import org.appwork.utils.StringUtils;
+import org.appwork.utils.parser.UrlQuery;
+import org.jdownloader.controlling.filter.CompiledFiletypeFilter;
+import org.jdownloader.plugins.components.config.KemonoPartyConfig;
+import org.jdownloader.plugins.components.config.KemonoPartyConfig.PostRevisionMode;
+import org.jdownloader.plugins.components.config.KemonoPartyConfig.TextCrawlMode;
+import org.jdownloader.plugins.components.config.KemonoPartyConfigCoomerParty;
+import org.jdownloader.plugins.config.PluginJsonConfig;
+import org.jdownloader.plugins.controller.LazyPlugin;
+import org.jdownloader.scripting.JavaScriptEngineFactory;
+
+import jd.PluginWrapper;
+import jd.controlling.ProgressController;
+import jd.controlling.linkcrawler.CrawledLink;
+import jd.http.Browser;
+import jd.http.URLConnectionAdapter;
+import jd.http.requests.GetRequest;
+import jd.nutils.encoding.Encoding;
+import jd.plugins.CryptedLink;
+import jd.plugins.DecrypterPlugin;
+import jd.plugins.DecrypterRetryException;
+import jd.plugins.DecrypterRetryException.RetryReason;
+import jd.plugins.DownloadLink;
+import jd.plugins.FilePackage;
+import jd.plugins.LinkStatus;
+import jd.plugins.PluginException;
+import jd.plugins.PluginForDecrypt;
+import jd.plugins.hoster.KemonoParty;
+
+@DecrypterPlugin(revision = "$Revision: 52067 $", interfaceVersion = 3, names = {}, urls = {})
+public class KemonoPartyCrawler extends PluginForDecrypt {
+    public KemonoPartyCrawler(PluginWrapper wrapper) {
+        super(wrapper);
+    }
+
+    @Override
+    public LazyPlugin.FEATURE[] getFeatures() {
+        return new LazyPlugin.FEATURE[] { LazyPlugin.FEATURE.BUBBLE_NOTIFICATION };
+    }
+
+    @Override
+    public Browser createNewBrowserInstance() {
+        final Browser br = super.createNewBrowserInstance();
+        br.setFollowRedirects(true);
+        return br;
+    }
+
+    @Override
+    public void init() {
+        for (String host : siteSupportedNames()) {
+            Browser.setRequestIntervalLimitGlobal(host, false, 250);
+        }
+        super.init();
+    }
+
+    public static List<String[]> getPluginDomains() {
+        final List<String[]> ret = new ArrayList<String[]>();
+        // each entry in List<String[]> will result in one PluginForDecrypt, Plugin.getHost() will return String[0]->main domain
+        ret.add(new String[] { "coomer.st", "coomer.su", "coomer.party" }); // onlyfans.com content
+        ret.add(new String[] { "kemono.cr", "kemono.su", "kemono.party" }); // content of other websites such as patreon.com
+        return ret;
+    }
+
+    public static String[] getAnnotationNames() {
+        return buildAnnotationNames(getPluginDomains());
+    }
+
+    @Override
+    public String[] siteSupportedNames() {
+        return buildSupportedNames(getPluginDomains());
+    }
+
+    public static String[] getAnnotationUrls() {
+        return buildAnnotationUrls(getPluginDomains());
+    }
+
+    public static String[] buildAnnotationUrls(final List<String[]> pluginDomains) {
+        final List<String> ret = new ArrayList<String>();
+        for (final String[] domains : pluginDomains) {
+            ret.add("https?://(?:www\\.)?" + buildHostsPatternPart(domains) + "/[^/]+/user/([\\w\\-\\.]+(\\?.+)?)(/post/[a-z0-9]+(/revision/(\\d+))?)?");
+        }
+        return ret.toArray(new String[0]);
+    }
+
+    private final String TYPE_PROFILE = "(?i)(?:https?://[^/]+)?/([^/]+)/user/([\\w\\-\\.]+)(\\?.+)?$";
+    private final String TYPE_POST    = "(?i)(?:https?://[^/]+)?/([^/]+)/user/([\\w\\-\\.]+)/post/([a-z0-9]+)(/revision/(\\d+))?$";
+    private KemonoParty  hostPlugin   = null;
+    private CryptedLink  cl           = null;
+
+    private String getApiBase() {
+        return "https://" + getHost() + "/api/v1";
+    }
+
+    private KemonoPartyConfig cfg = null;
+
+    public ArrayList<DownloadLink> decryptIt(final CryptedLink param, ProgressController progress) throws Exception {
+        cfg = PluginJsonConfig.get(getConfigInterface());
+        cl = param;
+        if (param.getCryptedUrl().matches(TYPE_PROFILE)) {
+            return this.crawlProfile(param);
+        } else if (param.getCryptedUrl().matches(TYPE_POST)) {
+            return this.crawlPost(param);
+        } else {
+            /* Unsupported URL --> Developer mistake */
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+    }
+
+    @Override
+    public void clean() {
+        cfg = null;
+        super.clean();
+    }
+
+    private ArrayList<DownloadLink> crawlProfile(final CryptedLink param) throws Exception {
+        final Regex urlinfo = new Regex(param.getCryptedUrl(), TYPE_PROFILE);
+        if (!urlinfo.patternFind()) {
+            /* Developer mistake */
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+        final String service = urlinfo.getMatch(0);
+        final String userID = urlinfo.getMatch(1);
+        final UrlQuery query = UrlQuery.parse(urlinfo.getMatch(2));
+        return crawlProfileAPI(service, userID, query);
+    }
+
+    /**
+     * @param startOffset
+     *            : If provided, only this offset/page will be crawled.
+     */
+    private ArrayList<DownloadLink> crawlProfileAPI(final String service, final String usernameOrUserID, final UrlQuery query) throws Exception {
+        if (service == null || usernameOrUserID == null) {
+            /* Developer mistake */
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+        final HashSet<String> dupes = new HashSet<String>();
+        final boolean useAdvancedDupecheck = cfg.isEnableProfileCrawlerAdvancedDupeFiltering();
+        final boolean perPostPackageEnabled = cfg.isPerPostURLPackageEnabled();
+        final ArrayList<DownloadLink> ret = new ArrayList<DownloadLink>();
+        final FilePackage profileFilePackage = getFilePackageForProfileCrawler(service, usernameOrUserID);
+        int offset = 0;
+        String offsetString = null;
+        String qString = null;
+        if (query != null) {
+            qString = query.get("q");
+            offsetString = query.getDecoded("o");
+            if (offsetString != null && offsetString.matches("^\\d+$")) {
+                logger.info("Starting from offset: " + offsetString);
+                offset = Integer.parseInt(offsetString);
+            }
+        }
+        if (qString == null) {
+            qString = "";
+        } else {
+            qString = "&q=" + qString;
+        }
+        int page = 1;
+        final int maxItemsPerPage = 50;
+        int numberofContinuousPagesWithoutAnyNewItems = 0;
+        final int maxPagesWithoutNewItems = 15;
+        final Set<String> retryWithSinglePostAPI = new HashSet<String>();
+        pagination: do {
+            getPage(br, this.getApiBase() + "/" + service + "/user/" + Encoding.urlEncode(usernameOrUserID) + "/posts?o=" + offset + qString);
+            final List<Map<String, Object>> posts = (List<Map<String, Object>>) restoreFromString(br.getRequest().getHtmlCode(), TypeRef.OBJECT);
+            if (posts == null || posts.isEmpty()) {
+                if (ret.isEmpty() && retryWithSinglePostAPI.isEmpty()) {
+                    if (!StringUtils.isEmpty(qString)) {
+                        throw new DecrypterRetryException(RetryReason.EMPTY_SEARCH_QUERY);
+                    }
+                    throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+                } else {
+                    /* This should never happen */
+                    logger.info("Stopping because: Got empty page");
+                    break pagination;
+                }
+            }
+            final int numberofUniqueItemsOld = dupes.size();
+            final int numberOfRetryPostsOld = retryWithSinglePostAPI.size();
+            for (final Map<String, Object> post : posts) {
+                if (true) {
+                    /* fetch all posts via single post api */
+                    retryWithSinglePostAPI.add(post.get("id").toString());
+                    continue;
+                } else {
+                    final ArrayList<DownloadLink> thisresults = this.crawlProcessPostAPI(post, dupes, useAdvancedDupecheck);
+                    if (post.get("content") == null && StringUtils.isNotEmpty(StringUtils.valueOfOrNull(post.get("substring")))) {
+                        // posts api no longer returns full post content but only a substring, so we have to retry with post api
+                        final TextCrawlMode mode = cfg.getTextCrawlMode();
+                        if (cfg.isCrawlHttpLinksFromPostContent() || mode == TextCrawlMode.ALWAYS || (mode == TextCrawlMode.ONLY_IF_NO_MEDIA_ITEMS_ARE_FOUND && thisresults.isEmpty())) {
+                            retryWithSinglePostAPI.add(post.get("id").toString());
+                            logger.info("Need to process item:" + post.get("id") + " again due to maybe incomplete post content");
+                            // we have to skip and reprocess later, else duplicate check will prevent reprocessed files to be added
+                            continue;
+                        }
+                    }
+                    if (cfg.isCrawlHttpLinksFromPostContent() && post.get("embed") == null) {
+                        // posts api no longer returns embed entry, so we have to retry with post api
+                        retryWithSinglePostAPI.add(post.get("id").toString());
+                        logger.info("Need to process item:" + post.get("id") + " again due to missing embed");
+                        // we have to skip and reprocess later, else duplicate check will prevent reprocessed files to be added
+                        continue;
+                    }
+                    for (final DownloadLink thisresult : thisresults) {
+                        if (!perPostPackageEnabled) {
+                            thisresult._setFilePackage(profileFilePackage);
+                        }
+                    }
+                    distribute(thisresults);
+                    ret.addAll(thisresults);
+                }
+            }
+            logger.info("Crawled page " + page + " | Found items so far: " + ret.size() + " | Retry posts so far: " + retryWithSinglePostAPI.size() + " | Offset: " + offset);
+            final int numberofUniqueItemsNew = dupes.size();
+            final int numberOfRetryPostsNew = retryWithSinglePostAPI.size();
+            final int numberofNewItems = (numberofUniqueItemsNew - numberofUniqueItemsOld) + (numberOfRetryPostsNew - numberOfRetryPostsOld);
+            if (numberofNewItems == 0) {
+                numberofContinuousPagesWithoutAnyNewItems++;
+            } else {
+                numberofContinuousPagesWithoutAnyNewItems = 0;
+            }
+            if (this.isAbort()) {
+                logger.info("Stopping because: Aborted by user");
+                break pagination;
+            } else if (StringUtils.isNotEmpty(offsetString)) {
+                logger.info("Stopping because: User provided specific offset to crawl: " + offsetString);
+                break pagination;
+            } else if (numberofContinuousPagesWithoutAnyNewItems >= maxPagesWithoutNewItems) {
+                logger.info("Stopping because: Too many pages without any new items: " + maxPagesWithoutNewItems);
+                break pagination;
+            } else if (posts.size() < maxItemsPerPage) {
+                logger.info("Stopping because: Reached last page(?) Page: " + page);
+                break pagination;
+            } else {
+                /* Continue to next page */
+                offset += posts.size();
+                page++;
+            }
+        } while (!this.isAbort());
+        final int retryWithSinglePostAPISize = retryWithSinglePostAPI.size();
+        logger.info("Need to process " + retryWithSinglePostAPISize + " items again due to maybe incomplete post content");
+        crawl_single_posts: {
+            int singlePostAPIIndex = 0;
+            while (!this.isAbort() && retryWithSinglePostAPI.size() > 0) {
+                singlePostAPIIndex++;
+                final String nextRetryPostID = retryWithSinglePostAPI.iterator().next();
+                retryWithSinglePostAPI.remove(nextRetryPostID);
+                final ArrayList<DownloadLink> thisresults = crawlPostAPI(br, service, usernameOrUserID, nextRetryPostID, null);
+                if (!perPostPackageEnabled) {
+                    for (final DownloadLink thisresult : thisresults) {
+                        thisresult._setFilePackage(profileFilePackage);
+                    }
+                }
+                distribute(thisresults);
+                ret.addAll(thisresults);
+                logger.info("Crawled single post " + singlePostAPIIndex + "/" + retryWithSinglePostAPISize + " | Found items for postID " + nextRetryPostID + ": " + thisresults.size() + " | Total so far: " + ret.size());
+            }
+        }
+        return ret;
+    }
+
+    private FilePackage getFilePackageForProfileCrawler(final String service, final String userID) {
+        final FilePackage fp = FilePackage.getInstance();
+        fp.setAllowMerge(true);
+        fp.setAllowInheritance(true);
+        fp.setName(service + " - " + userID);
+        fp.setPackageKey(KemonoParty.UNIQUE_ID_PREFIX + "service/" + service + "/userid/" + userID);
+        return fp;
+    }
+
+    private FilePackage getFilePackageForPostCrawler(final String service, final String userID, final String postID, final String postTitle) {
+        final FilePackage fp = FilePackage.getInstance();
+        if (postTitle != null) {
+            fp.setName(service + " - " + userID + " - " + postID + " - " + postTitle);
+        } else {
+            /* Fallback */
+            fp.setName(service + " - " + userID + " - " + postID);
+        }
+        fp.setIgnoreVarious(true);
+        fp.setPackageKey(KemonoParty.UNIQUE_ID_PREFIX + "service/" + service + "/userid/" + userID + "/postid/" + postID);
+        return fp;
+    }
+
+    private ArrayList<DownloadLink> crawlPost(final CryptedLink param) throws Exception {
+        final Regex urlinfo = new Regex(param.getCryptedUrl(), TYPE_POST);
+        if (!urlinfo.patternFind()) {
+            /* Developer mistake */
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+        final String service = urlinfo.getMatch(0);
+        final String usernameOrUserID = urlinfo.getMatch(1);
+        final String postID = urlinfo.getMatch(2);
+        final String revisionID = urlinfo.getMatch(4);
+        return crawlPostAPI(br, service, usernameOrUserID, postID, revisionID);
+    }
+
+    /** API docs: https://kemono.su/api/schema */
+    private ArrayList<DownloadLink> crawlPostAPI(final Browser br, final String service, final String userID, final String postID, final String revisionID) throws Exception {
+        if (service == null || userID == null || postID == null) {
+            /* Developer mistake */
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+        if (revisionID != null && !revisionID.matches("\\d+")) {
+            /* Developer mistake */
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+        }
+        String url = this.getApiBase() + "/" + service + "/user/" + userID + "/post/" + postID;
+        final PostRevisionMode revisionMode = cfg.getPostRevisionMode().getMode();
+        final boolean request_specific_revision = true;
+        if (PostRevisionMode.SELECTED.equals(revisionMode) && revisionID != null && request_specific_revision) {
+            url += "/revision/" + revisionID;
+        }
+        getPage(br, url);
+        final Map<String, Object> entries = restoreFromString(br.getRequest().getHtmlCode(), TypeRef.MAP);
+        final Map<String, Map<String, Object>> postRevisions = new HashMap<String, Map<String, Object>>();
+        mainPostResponse: {
+            final Map<String, Object> post = (Map<String, Object>) entries.get("post");
+            postRevisions.put(StringUtils.valueOfOrNull(post.get("revision_id")), post);// null -> head revision
+        }
+        otherPostRevisions: {
+            final List<List<Object>> revisions = (List<List<Object>>) JavaScriptEngineFactory.walkJson(entries, "props/revisions");
+            if (revisions == null || revisions.size() == 0) {
+                break otherPostRevisions;
+            }
+            for (final List<Object> revision : revisions) {
+                final Map<String, Object> post = (Map<String, Object>) revision.get(1);
+                final String post_revision = StringUtils.valueOfOrNull(post.get("revision_id"));// null -> head revision
+                if (!postRevisions.containsKey(post_revision)) {
+                    postRevisions.put(post_revision, post);
+                }
+            }
+        }
+        switch (revisionMode) {
+        case ALL:
+            break;
+        case LATEST:
+            final Map<String, Object> head = postRevisions.get(null);
+            if (head != null) {
+                postRevisions.clear();
+                postRevisions.put(null, head);
+            }
+            break;
+        case SELECTED:
+            final Map<String, Object> selected = postRevisions.get(revisionID);
+            if (selected != null) {
+                postRevisions.clear();
+                postRevisions.put(revisionID, selected);
+            }
+            break;
+        default:
+            throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT, "Unsupported PostRevisionMode:" + revisionMode);
+        }
+        processPosts: {
+            final HashSet<String> dupe = new HashSet<String>();
+            final ArrayList<DownloadLink> ret = new ArrayList<DownloadLink>();
+            for (Map<String, Object> postRevision : postRevisions.values()) {
+                ret.addAll(crawlProcessPostAPI(postRevision, dupe, false));
+            }
+            return ret;
+        }
+    }
+
+    /**
+     * Processes a map of an API response containing information about a users' post.
+     *
+     * @throws Exception
+     */
+    private ArrayList<DownloadLink> crawlProcessPostAPI(final Map<String, Object> postmap, final HashSet<String> dupes, final boolean useAdvancedDupecheck) throws Exception {
+        final String service = postmap.get("service").toString();
+        final String usernameOrUserID = postmap.get("user").toString();
+        final String postID = postmap.get("id").toString();
+        /**
+         * revision_id is not always given in post object. If it is not given, we are on the latest revision. <br>
+         * API sometimes refers to current revision_id as "current" but we will only store it if the field is available, then it's usually a
+         * number. <br>
+         * If it is given, we did explicitly specify a desired revision_id in the API call before. <br>
+         * If given, this field is a Number field.
+         */
+        final String revisionID = StringUtils.valueOfOrNull(postmap.get("revision_id"));
+        final String posturl = "https://" + this.getHost() + "/" + service + "/user/" + usernameOrUserID + "/post/" + postID;
+        final String postTitle = postmap.get("title").toString();
+        /* Every item has a "published" date */
+        final String publishedDateStr = StringUtils.valueOfOrNull(postmap.get("published"));
+        /* Not all items have a "edited" date */
+        final String editedDateStr = StringUtils.valueOfOrNull(postmap.get("edited"));
+        final ArrayList<DownloadLink> kemonoResults = new ArrayList<DownloadLink>();
+        int numberofResultsSimpleCount = 0;
+        int index = 0;
+        final Map<String, Object> filemap = (Map<String, Object>) postmap.get("file");
+        if (!filemap.isEmpty()) {
+            final DownloadLink media = buildFileDownloadLinkAPI(dupes, useAdvancedDupecheck, filemap, index);
+            /* null = item is a duplicate */
+            if (media != null) {
+                kemonoResults.add(media);
+                index++;
+            }
+            numberofResultsSimpleCount++;
+        }
+        final List<Map<String, Object>> attachments = (List<Map<String, Object>>) postmap.get("attachments");
+        if (attachments != null) {
+            for (final Map<String, Object> attachment : attachments) {
+                final DownloadLink media = buildFileDownloadLinkAPI(dupes, useAdvancedDupecheck, attachment, index);
+                /* null = item is a duplicate */
+                if (media != null) {
+                    kemonoResults.add(media);
+                    index++;
+                }
+                numberofResultsSimpleCount++;
+            }
+        }
+        logger.info("service: " + service + " | UserID: " + usernameOrUserID + " | PostID: " + postID + " | File items in API response: " + numberofResultsSimpleCount + " | Number of unique file items: " + kemonoResults.size());
+        final ArrayList<DownloadLink> ret = new ArrayList<DownloadLink>();
+        final FilePackage postFilePackage = getFilePackageForPostCrawler(service, usernameOrUserID, postID, postTitle);
+        String postTextContent = (String) postmap.get("content");
+        if (!StringUtils.isEmpty(postTextContent)) {
+            if (cfg.isCrawlHttpLinksFromPostContent()) {
+                /* Place number 1 where we can crawl external http links from */
+                postTextContent = postTextContent.replaceAll("[\\xA0]+", " ");
+                postTextContent = postTextContent.replaceAll("(?i)Key(\\s*for\\s*the\\s*link)?\\s*:", "KEY:");
+                postTextContent = postTextContent.replaceAll("(?i)<a[^>]href\\s*=\\s*\"(.*?)\"[^>]*>\\s*\\1\\s*</a>(?:\\s*</p>[^>]*<p>)?\\s*(?:#|KEY:)\\s*([^< ]*)", "<a href=\"$1#$2\"</a>");
+                final List<CrawledLink> postTextContentLinks = getCrawler().find(getLinkCrawlerGeneration(), getCurrentLink(), postTextContent, br.getURL(), false, false);
+                if (postTextContentLinks != null) {
+                    for (CrawledLink postTextContentLink : postTextContentLinks) {
+                        try {
+                            final URL url = new URL(postTextContentLink.getURL());
+                            if (!dupes.add(url.getPath())) {
+                                // alread part of attachments
+                                continue;
+                            }
+                        } catch (final MalformedURLException e) {
+                            logger.log(e);
+                        }
+                        ret.add(this.createDownloadlink(postTextContentLink.getURL()));
+                    }
+                }
+            }
+            final TextCrawlMode mode = cfg.getTextCrawlMode();
+            if (mode == TextCrawlMode.ALWAYS || (mode == TextCrawlMode.ONLY_IF_NO_MEDIA_ITEMS_ARE_FOUND && kemonoResults.isEmpty())) {
+                ensureInitHosterplugin();
+                final DownloadLink textfile = new DownloadLink(this.hostPlugin, this.getHost(), posturl);
+                textfile.setProperty(KemonoParty.PROPERTY_TEXT, postTextContent);
+                textfile.setFinalFileName(postFilePackage.getName() + ".txt");
+                try {
+                    textfile.setDownloadSize(postTextContent.getBytes("UTF-8").length);
+                } catch (final UnsupportedEncodingException ignore) {
+                    ignore.printStackTrace();
+                }
+                kemonoResults.add(textfile);
+            }
+        }
+        if (cfg.isCrawlHttpLinksFromPostContent()) {
+            /* Place number 2 where we can crawl external http links from */
+            final Map<String, Object> embedmap = (Map<String, Object>) postmap.get("embed");
+            if (embedmap != null && embedmap.size() > 0) {
+                final String url = embedmap.get("url").toString();
+                ret.add(this.createDownloadlink(url));
+            }
+        }
+        final String username = this.findUsername(service, usernameOrUserID);
+        for (final DownloadLink kemonoResult : kemonoResults) {
+            if (!StringUtils.isEmpty(postTitle)) {
+                kemonoResult.setProperty(KemonoParty.PROPERTY_TITLE, postTitle);
+            }
+            if (!StringUtils.isEmpty(postTextContent)) {
+                kemonoResult.setProperty(KemonoParty.PROPERTY_POST_TEXT, postTextContent);
+            }
+            if (publishedDateStr != null) {
+                kemonoResult.setProperty(KemonoParty.PROPERTY_DATE, publishedDateStr);
+            }
+            if (editedDateStr != null) {
+                kemonoResult.setProperty(KemonoParty.PROPERTY_DATE_EDIT, editedDateStr);
+            }
+            kemonoResult.setProperty(KemonoParty.PROPERTY_PORTAL, service);
+            kemonoResult.setProperty(KemonoParty.PROPERTY_USERID, usernameOrUserID);
+            kemonoResult.setProperty(KemonoParty.PROPERTY_USERNAME, username);
+            kemonoResult.setProperty(KemonoParty.PROPERTY_POST_ID, postID);
+            kemonoResult.setProperty(KemonoParty.PROPERTY_REVISION_ID, revisionID);
+            kemonoResult.setAvailable(true);
+            /* Add kemono item to our list of total results. */
+            ret.add(kemonoResult);
+        }
+        if (DebugMode.TRUE_IN_IDE_ELSE_FALSE) {
+            // Test 2024-03-25, see: https://board.jdownloader.org/showthread.php?t=95398
+            /* Set post-URL as container URL on all items. */
+            for (final DownloadLink result : ret) {
+                result.setContainerUrl(posturl);
+            }
+        }
+        if (DebugMode.TRUE_IN_IDE_ELSE_FALSE) {
+            // postFilePackage.setName(String.format(Locale.ROOT,"[@DEV: %d Expected kemono results] ", kemonoResults.size()) +
+            // postFilePackage.getName());
+        }
+        postFilePackage.addLinks(ret);
+        return ret;
+    }
+
+    private DownloadLink buildFileDownloadLinkAPI(final HashSet<String> dupes, final boolean advancedDupeCheck, final Map<String, Object> filemap, final int index) throws PluginException {
+        this.ensureInitHosterplugin();
+        /**
+         * 2025-06-02: Looks like the "name" field is not always given though it missing can also mean that the original file is
+         * broken/missing on the server. <br>
+         * Example: /fanbox/user/64937143/post/2095805
+         */
+        String filename = (String) filemap.get("name");
+        final String filepath = filemap.get("path").toString();
+        String url = "https://" + this.getHost() + "/data" + filepath;
+        if (filename != null) {
+            final String nameExt = Files.getExtension(filename, true);
+            final String pathExt = Files.getExtension(filepath, true);
+            if (CompiledFiletypeFilter.ImageExtensions.JPG.isSameExtensionGroup(CompiledFiletypeFilter.getExtensionsFilterInterface(nameExt)) && CompiledFiletypeFilter.ImageExtensions.JPG.isSameExtensionGroup(CompiledFiletypeFilter.getExtensionsFilterInterface(pathExt))) {
+                // both name and path have ImageExtensions so we trust path extension more
+                filename = correctOrApplyFileNameExtension(filename, pathExt, null);
+            }
+            url += "?f=" + Encoding.urlEncode(filename);
+        }
+        final String sha256hash = KemonoParty.getSha256HashFromURL(url);
+        final String dupeCheckString;
+        if (advancedDupeCheck && sha256hash != null) {
+            dupeCheckString = sha256hash;
+        } else {
+            dupeCheckString = filepath;
+        }
+        if (!dupes.add(dupeCheckString)) {
+            /* Skip dupe */
+            return null;
+        }
+        final DownloadLink media = new DownloadLink(this.hostPlugin, this.getHost(), url);
+        if (filename != null) {
+            media.setFinalFileName(filename);
+            media.setProperty(KemonoParty.PROPERTY_BETTER_FILENAME, filename);
+        }
+        media.setProperty(KemonoParty.PROPERTY_POST_CONTENT_INDEX, index);
+        if (sha256hash != null) {
+            media.setSha256Hash(sha256hash);
+        }
+        return media;
+    }
+
+    private static Map<String, String> ID_TO_USERNAME = new LinkedHashMap<String, String>() {
+        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+            return size() > 100;
+        };
+    };
+
+    /**
+     * Returns userID for given username. </br>
+     * Uses API to find userID. </br>
+     * Throws Exception if it is unable to find userID.
+     */
+    private String findUsername(final String service, final String usernameOrUserID) throws Exception {
+        synchronized (ID_TO_USERNAME) {
+            if (StringUtils.isEmpty(usernameOrUserID)) {
+                /* Developer mistake */
+                throw new IllegalArgumentException();
+            }
+            if (!usernameOrUserID.matches("\\d+")) {
+                /* Not an ID but a username already */
+                return usernameOrUserID;
+            }
+            final String key = service + "_" + usernameOrUserID;
+            String username = ID_TO_USERNAME.get(key);
+            if (username != null) {
+                return username;
+            }
+            final Browser brc = br.cloneBrowser();
+            getPage(brc, this.getApiBase() + "/" + service + "/user/" + usernameOrUserID + "/profile");
+            final Map<String, Object> entries = restoreFromString(brc.getRequest().getHtmlCode(), TypeRef.MAP);
+            username = entries.get("name").toString();
+            if (StringUtils.isEmpty(username)) {
+                throw new PluginException(LinkStatus.ERROR_PLUGIN_DEFECT);
+            }
+            ID_TO_USERNAME.put(key, username);
+            return username;
+        }
+    }
+
+    public static String getBetterFilenameFromURL(final String url) throws MalformedURLException {
+        final UrlQuery query = UrlQuery.parse(url);
+        final String betterFilename = query.get("f");
+        if (betterFilename != null) {
+            return Encoding.htmlDecode(betterFilename).trim();
+        } else {
+            return null;
+        }
+    }
+
+    private void ensureInitHosterplugin() throws PluginException {
+        if (this.hostPlugin == null) {
+            this.hostPlugin = (KemonoParty) getNewPluginForHostInstance(this.getHost());
+        }
+    }
+
+    @Override
+    public int getMaxConcurrentProcessingInstances() {
+        /* Try to avoid getting blocked by DDOS-GUARD / rate-limited. */
+        return 1;
+    }
+
+    protected void getPage(final Browser br, final String url) throws Exception {
+        final int maxTries = 15;
+        final Random rnd = new Random();
+        for (int i = 0; i <= maxTries; i++) {
+            final boolean lastTry = i == maxTries;
+            final GetRequest getRequest = br.createGetRequest(url);
+            // If you want to scrape, use "Accept: text/css" header in your requests for now. For whatever reason DDG does not like SPA and
+            // JSON, so we have to be funny. And you are no exception to caching.
+            getRequest.getHeaders().put(HTTPConstants.HEADER_REQUEST_ACCEPT, "text/css");
+            final URLConnectionAdapter con = br.openRequestConnection(getRequest);
+            try {
+                if (this.isAbort()) {
+                    /* Aborted by user */
+                    throw new InterruptedException();
+                } else if (con.getResponseCode() == 404) {
+                    br.followConnection(true);
+                    /* E.g. {"error":"Not Found"} */
+                    throw new PluginException(LinkStatus.ERROR_FILE_NOT_FOUND);
+                } else if (con.getResponseCode() == 429) {
+                    br.followConnection(true);
+                    logger.info("Error 429 too many requests");
+                    if (lastTry) {
+                        throw new DecrypterRetryException(RetryReason.HOST_RATE_LIMIT);
+                    }
+                    final int retrySeconds = 10 + rnd.nextInt(10);
+                    final String title = "Rate-Limit reached";
+                    String text = "Time until rate-limit reset: Unknown | Attempt " + (i + 1) + "/" + maxTries;
+                    text += "\nTry again later or change your IP | Auto retry in " + retrySeconds + " seconds";
+                    this.displayBubbleNotification(title, text);
+                    this.sleep(retrySeconds * 1000, this.cl);
+                    continue;
+                } else if (con.getResponseCode() == 503) {
+                    br.followConnection(true);
+                    logger.info("Error 503 " + con.getResponseMessage());
+                    if (lastTry) {
+                        throw new DecrypterRetryException(RetryReason.HOST);
+                    }
+                    final int retrySeconds = 3 + rnd.nextInt(10);
+                    this.sleep(retrySeconds * 1000, this.cl);
+                    continue;
+                } else {
+                    br.followConnection();
+                    return;
+                }
+            } finally {
+                con.disconnect();
+            }
+        }
+    }
+
+    @Override
+    public Class<? extends KemonoPartyConfig> getConfigInterface() {
+        if ("kemono.party".equalsIgnoreCase(getHost())) {
+            return KemonoPartyConfig.class;
+        } else {
+            return KemonoPartyConfigCoomerParty.class;
+        }
+    }
+}
