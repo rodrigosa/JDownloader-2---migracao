@@ -7,10 +7,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import jd.controlling.downloadcontroller.DownloadController;
+import jd.controlling.downloadcontroller.IDownloadController;
 import jd.controlling.downloadcontroller.DownloadSession.STOPMARK;
 import jd.controlling.downloadcontroller.DownloadWatchDog;
 import jd.controlling.packagecontroller.AbstractNode;
+import jd.controlling.packagecontroller.PackageController;
 import jd.plugins.DecrypterRetryException.RetryReason;
 import jd.plugins.DownloadLink;
 import jd.plugins.DownloadLink.AvailableStatus;
@@ -46,21 +47,23 @@ import org.jdownloader.plugins.WaitingSkipReason;
 
 public class DownloadsAPIV2Impl implements DownloadsAPIV2 {
     private final PackageControllerUtils<FilePackage, DownloadLink> packageControllerUtils;
+    private final IDownloadController                               downloadController;
 
-    public DownloadsAPIV2Impl() {
+    public DownloadsAPIV2Impl(IDownloadController downloadController) {
+        this.downloadController = downloadController;
         RemoteAPIController.validateInterfaces(DownloadsAPIV2.class, DownloadsListInterface.class);
-        packageControllerUtils = new PackageControllerUtils<FilePackage, DownloadLink>(DownloadController.getInstance());
+        packageControllerUtils = new PackageControllerUtils<FilePackage, DownloadLink>((PackageController<FilePackage, DownloadLink>) downloadController);
     }
 
     @Override
     public List<FilePackageAPIStorableV2> queryPackages(PackageQueryStorable queryParams) throws BadParameterException {
-        DownloadController dlc = DownloadController.getInstance();
+        // DownloadController dlc = DownloadController.getInstance();
         // filter out packages, if specific packageUUIDs given, else return all packages
         List<FilePackage> packages = null;
         if (queryParams.getPackageUUIDs() != null && queryParams.getPackageUUIDs().length > 0) {
             packages = packageControllerUtils.getPackages(queryParams.getPackageUUIDs());
         } else {
-            packages = dlc.getPackagesCopy();
+            packages = downloadController.getPackages();
         }
         List<FilePackageAPIStorableV2> ret = new ArrayList<FilePackageAPIStorableV2>(packages.size());
         if (packages.size() == 0) {
@@ -111,7 +114,7 @@ public class DownloadsAPIV2Impl implements DownloadsAPIV2 {
     @Override
     public List<DownloadLinkAPIStorableV2> queryLinks(LinkQueryStorable queryParams) {
         final List<DownloadLinkAPIStorableV2> result = new ArrayList<DownloadLinkAPIStorableV2>();
-        final DownloadController dlc = DownloadController.getInstance();
+        // final DownloadController dlc = DownloadController.getInstance();
         final List<DownloadLink> links = new ArrayList<DownloadLink>();
         if (queryParams.getLinkUUIDs() != null && queryParams.getLinkUUIDs().length > 0) {
             links.addAll(packageControllerUtils.getChildren(queryParams.getLinkUUIDs()));
@@ -120,7 +123,7 @@ public class DownloadsAPIV2Impl implements DownloadsAPIV2 {
             if (queryParams.getPackageUUIDs() != null && queryParams.getPackageUUIDs().length > 0) {
                 packages = packageControllerUtils.getPackages(queryParams.getPackageUUIDs());
             } else {
-                packages = dlc.getPackagesCopy();
+                packages = downloadController.getPackages();
             }
             if (queryParams.getJobUUIDs() != null && queryParams.getJobUUIDs().length > 0) {
                 final Set<Long> jobUUIDs = new HashSet<Long>();
@@ -421,7 +424,7 @@ public class DownloadsAPIV2Impl implements DownloadsAPIV2 {
                         dls.setStatus(label);
                     }
                 }
-                break;
+                    break;
                 case SUCCESSFUL: {
                     entry.put("iconKey", IconKey.ICON_EXTRACT_OK);
                     final String label = extractionStatus.getExplanation();
@@ -431,7 +434,7 @@ public class DownloadsAPIV2Impl implements DownloadsAPIV2 {
                         dls.setStatus(label);
                     }
                 }
-                break;
+                    break;
                 case RUNNING: {
                     entry.put("iconKey", IconKey.ICON_EXTRACT);
                     final String label = extractionStatus.getExplanation();
@@ -441,7 +444,7 @@ public class DownloadsAPIV2Impl implements DownloadsAPIV2 {
                         dls.setStatus(label);
                     }
                 }
-                break;
+                    break;
                 default:
                     break;
                 }
@@ -505,7 +508,7 @@ public class DownloadsAPIV2Impl implements DownloadsAPIV2 {
 
     @Override
     public int packageCount() {
-        return DownloadController.getInstance().size();
+        return downloadController.size();
     }
 
     @Override
@@ -516,18 +519,18 @@ public class DownloadsAPIV2Impl implements DownloadsAPIV2 {
     @Override
     public void renamePackage(Long packageId, String newName) {
         if (packageId != null && newName != null) {
-            DownloadController dlc = DownloadController.getInstance();
+            // DownloadController dlc = DownloadController.getInstance();
             FilePackage fp = null;
-            final boolean readL = dlc.readLock();
+            final boolean readL = downloadController.readLock();
             try {
-                for (final FilePackage pkg : dlc.getPackages()) {
+                for (final FilePackage pkg : downloadController.getPackages()) {
                     if (packageId.longValue() == pkg.getUniqueID().getID()) {
                         fp = pkg;
                         break;
                     }
                 }
             } finally {
-                dlc.readUnlock(readL);
+                downloadController.readUnlock(readL);
             }
             if (fp != null) {
                 fp.setName(newName);
@@ -538,8 +541,7 @@ public class DownloadsAPIV2Impl implements DownloadsAPIV2 {
     @Override
     public void renameLink(Long linkId, String newName) {
         if (newName != null && linkId != null) {
-            DownloadController dwd = DownloadController.getInstance();
-            final DownloadLink link = dwd.getLinkByID(linkId);
+            final DownloadLink link = downloadController.getLinkByID(linkId);
             if (link != null) {
                 DownloadWatchDog.getInstance().renameLink(link, newName);
             }

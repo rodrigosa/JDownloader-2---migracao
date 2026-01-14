@@ -471,7 +471,9 @@ public class RemoteAPIController {
         DownloadWatchDogEventPublisher downloadWatchDogEventPublisher = new DownloadWatchDogEventPublisher();
         DownloadsAPIImpl downloadsAPI;
         register(downloadsAPI = new DownloadsAPIImpl());
-        register(downloadsAPIV2 = new DownloadsAPIV2Impl());
+        @SuppressWarnings("deprecation")
+        DownloadsAPIV2Impl dImpl = new DownloadsAPIV2Impl(jd.controlling.downloadcontroller.DownloadController.getInstance());
+        register(downloadsAPIV2 = dImpl);
         register(new DownloadWatchdogAPIImpl());
         register(downloadWatchDogEventPublisher);
         register(advancedConfigAPI = new AdvancedConfigManagerAPIImpl());
